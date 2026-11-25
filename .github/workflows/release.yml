@@ -1,0 +1,93 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag (e.g. v0.1.0)"
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  build-release:
+    name: Build & Publish Linux x86_64 CUDA 12.8 (sm_80)
+    runs-on: ubuntu-24.04
+    container:
+      image: nvidia/cuda:12.8.1-devel-ubuntu22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve release tag
+        id: meta
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            TAG="${{ inputs.tag }}"
+          else
+            TAG="${GITHUB_REF_NAME}"
+          fi
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+          echo "archive=amperegen-${TAG}-linux-x86_64-cu128-sm80.tar.gz" >> "$GITHUB_OUTPUT"
+
+      - name: Install CMake and Ninja
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends cmake ninja-build
+
+      - name: Configure & Build (portable x86-64-v3, sm_80)
+        run: |
+          cmake -S . -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DAMPEREGEN_PORTABLE=ON
+          ninja -C build amperegen amperegen_test amperegen_unit_tests
+
+      - name: Run CPU unit tests
+        run: ./build/amperegen_unit_tests
+
+      - name: Package release archive
+        run: |
+          STAGE="dist/amperegen-${{ steps.meta.outputs.tag }}-linux-x86_64-cu128-sm80"
+          mkdir -p "${STAGE}/bin" "${STAGE}/sidecar" "${STAGE}/docs"
+          cp build/amperegen build/amperegen_test "${STAGE}/bin/"
+          cp sidecar/app.py sidecar/requirements.txt "${STAGE}/sidecar/"
+          cp docs/amperegen.service docs/BENCHMARK.md "${STAGE}/docs/"
+          cp README.md LICENSE THIRD_PARTY.md "${STAGE}/"
+          chmod +x "${STAGE}/bin/amperegen" "${STAGE}/bin/amperegen_test" "${STAGE}/sidecar/app.py"
+          tar -C dist -czf "dist/${{ steps.meta.outputs.archive }}" "$(basename "${STAGE}")"
+          (cd dist && sha256sum "${{ steps.meta.outputs.archive }}" > SHA256SUMS.txt)
+          cat dist/SHA256SUMS.txt
+          ldd build/amperegen
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.meta.outputs.tag }}
+          name: amperegen ${{ steps.meta.outputs.tag }}
+          generate_release_notes: true
+          body: |
+            Prebuilt portable Linux `x86_64` (`x86-64-v3` / AVX2) binary compiled with **CUDA 12.8** targeting **NVIDIA Ampere (`sm_80`)** GPUs (CMP 170HX 64GB, A100 80GB).
+
+            ### Runtime Requirements
+            - Linux `x86_64` with glibc >= 2.35 (Ubuntu 22.04+, Debian 12+, Fedora 36+, RHEL/Rocky 9+)
+            - NVIDIA Driver supporting CUDA 12.8+ and CUDA 12 runtime libraries (`libcudart.so.12`, `libcublas.so.12`, `libcublasLt.so.12`)
+            - Python 3.10+ with `pip install -r sidecar/requirements.txt` for the tokenizer sidecar
+
+            ### Quick Start
+            ```bash
+            tar -xzf ${{ steps.meta.outputs.archive }}
+            cd amperegen-${{ steps.meta.outputs.tag }}-linux-x86_64-cu128-sm80
+            python3 -m venv .venv && .venv/bin/pip install -r sidecar/requirements.txt
+            ./bin/amperegen \
+              --model-path /path/to/Qwen3.8-27B-FP8 \
+              --draft-path /path/to/Qwen3.8-27B-DFlash2 \
+              --python ./.venv/bin/python \
+              --sidecar-script ./sidecar/app.py
+            ```
+          files: |
+            dist/${{ steps.meta.outputs.archive }}
+            dist/SHA256SUMS.txt

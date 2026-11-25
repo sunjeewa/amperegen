@@ -1,5 +1,8 @@
 # `amperegen`
 
+[![CI](https://github.com/sunjeewa/amperegen/actions/workflows/ci.yml/badge.svg)](https://github.com/sunjeewa/amperegen/actions/workflows/ci.yml)
+[![License: Apache-2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
+
 Dedicated C++20 + CUDA (`sm_80`) LLM inference engine built specifically for **NVIDIA Ampere (`sm_80`) 64 GB+ GPUs** (tested on **CMP 170HX 64GB**, GA100, 70 SMs, 210 W cap; also compatible with A100 80GB) serving **`Qwen3.8-27B-FP8`** (48 Gated DeltaNet + 16 Full-Attention layers) with **`Qwen3.8-27B-DFlash2`** speculative decoding.
 
 Compared against **SGLang 0.5.20** on the same CMP 170HX (210 W cap):
@@ -39,14 +42,19 @@ See [docs/BENCHMARK.md](docs/BENCHMARK.md) for full measured numbers and [DESIGN
 ## Building
 
 ```bash
-# 1. Build the C++20 / CUDA binary
+# 1. Build the C++20 / CUDA binaries (-DAMPEREGEN_PORTABLE=ON for portable x86-64-v3 builds)
 cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
-ninja -C build amperegen amperegen_test
+ninja -C build amperegen amperegen_test amperegen_unit_tests
 
-# 2. Set up the lightweight Python venv for the tokenizer sidecar
+# 2. Run CPU unit tests
+./build/amperegen_unit_tests
+
+# 3. Set up the lightweight Python venv for the tokenizer sidecar
 python3 -m venv .venv
 .venv/bin/pip install -r sidecar/requirements.txt
 ```
+
+Prebuilt Linux `x86_64` CUDA 12.8 (`sm_80`) release tarballs are published automatically on `v*` git tags via [GitHub Releases](https://github.com/sunjeewa/amperegen/releases).
 
 <details>
 <summary>Note for Fedora 44 (GCC 15 + CUDA 12.8)</summary>

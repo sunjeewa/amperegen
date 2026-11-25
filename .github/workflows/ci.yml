@@ -1,0 +1,78 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  cpu-tests:
+    name: CPU Unit Tests & Python Checks
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build and run C++ unit tests
+        run: |
+          g++ -std=c++20 -O2 -Wall -Wextra -Werror -Icpp tests/test_tool_parser.cpp -o /tmp/amperegen_unit_tests
+          /tmp/amperegen_unit_tests
+
+      - name: Check Python syntax and sidecar normalization
+        run: |
+          python3 -m py_compile sidecar/app.py ref/torch_ref.py tools/*.py
+          python3 - <<'PY'
+          import ast, json, types, sys
+          # Import TokenizerService._normalize_messages without requiring transformers installed
+          fake_tf = types.ModuleType("transformers")
+          fake_tf.AutoTokenizer = object
+          sys.modules["transformers"] = fake_tf
+          sys.path.insert(0, "sidecar")
+          from app import TokenizerService
+
+          msgs = [
+              {"role": "developer", "content": "System A"},
+              {"role": "system", "content": "System B"},
+              {"role": "user", "content": "Hi"},
+              {
+                  "role": "assistant",
+                  "content": None,
+                  "reasoning": "plan",
+                  "tool_calls": [
+                      {"id": "call_1", "type": "function", "function": {"name": "bash", "arguments": "{\"command\": \"ls\"}"}}
+                  ],
+              },
+              {"role": "tool", "tool_call_id": "call_1", "content": "ok"},
+          ]
+          norm = TokenizerService._normalize_messages(msgs)
+          assert len(norm) == 4
+          assert norm[0] == {"role": "system", "content": "System A\n\nSystem B"}
+          assert norm[2]["reasoning_content"] == "plan"
+          assert norm[2]["tool_calls"][0]["function"]["arguments"] == {"command": "ls"}
+          print("[PASS] sidecar message normalization")
+          PY
+
+  cuda-build:
+    name: CUDA 12.8 (sm_80) Build
+    runs-on: ubuntu-24.04
+    container:
+      image: nvidia/cuda:12.8.1-devel-ubuntu22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install CMake and Ninja
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends cmake ninja-build
+
+      - name: Configure & Build (portable x86-64-v3, sm_80)
+        run: |
+          cmake -S . -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DAMPEREGEN_PORTABLE=ON
+          ninja -C build amperegen amperegen_test amperegen_unit_tests
+
+      - name: Run unit tests & verify binary linkage
+        run: |
+          ./build/amperegen_unit_tests
+          ldd ./build/amperegen
