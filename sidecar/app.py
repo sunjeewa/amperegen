@@ -137,7 +137,17 @@ class TokenizerService:
             )
             ids = self.tok.encode(rendered, add_special_tokens=False)
             in_think = rendered.rstrip().endswith("<think>")
-            return {"token_ids": ids, "in_think": in_think}
+            # Detect exact system-prompt (+ tools) prefix boundary for shared-system prefix caching
+            sys_prefix_len = 0
+            if rendered.startswith("<|im_start|>system\n"):
+                end_marker = "<|im_end|>\n"
+                end_idx = rendered.find(end_marker)
+                if end_idx != -1:
+                    sys_str = rendered[: end_idx + len(end_marker)]
+                    sys_ids = self.tok.encode(sys_str, add_special_tokens=False)
+                    if 256 <= len(sys_ids) < len(ids) and ids[: len(sys_ids)] == sys_ids:
+                        sys_prefix_len = len(sys_ids)
+            return {"token_ids": ids, "in_think": in_think, "sys_prefix_len": sys_prefix_len}
         if op == "detokenize":
             ids = req.get("token_ids", [])
             skip_special = bool(req.get("skip_special_tokens", True))

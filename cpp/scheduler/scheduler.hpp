@@ -37,18 +37,22 @@ struct TokenEvent {
 struct Request {
     uint64_t id = 0;
     std::vector<int32_t> prompt_ids;
+    std::vector<int32_t> committed_tokens; // exact tokens [0..seq_len-1] committed into KV/GDN/DFlash2
+    int sys_prefix_len = 0;                // optional system-prompt+tools boundary for shared-system caching
     SamplingParams sampling;
 
     // Runtime state (owned by scheduler thread once admitted)
     int state_slot = -1;
     std::vector<int32_t> kv_blocks;
     int prefill_offset = 0;
+    int cached_tokens = 0;    // tokens restored from hybrid prefix cache
     int seq_len = 0;          // total tokens currently committed in KV cache
     int32_t anchor_token = 0; // last emitted token (next step's anchor)
     int generated_tokens = 0;
     uint64_t rng_state = 123456789ULL;
     bool prefill_done = false;
     bool active = false;
+    bool clean_commit_for_cache = true; // false if post-EOS/post-limit tokens were committed during spec verify
 
     // Per-request telemetry timers & counters (PP, TG, TTFT, spec accept)
     std::chrono::steady_clock::time_point t_submit{};
@@ -107,7 +111,8 @@ struct EngineConfig {
     bool draft_fp8 = true;     // 100% lossless for target!
     bool fp8_lm_draft = true;  // 100% lossless for target!
     bool enable_cuda_graph = true;
-    size_t kv_pool_bytes = 18ULL * 1024 * 1024 * 1024; // ~589K FP8 KV tokens (~3x SGLang!) with 4.5 GB VRAM headroom!
+    size_t kv_pool_bytes = 18ULL * 1024 * 1024 * 1024; // ~589K FP8 KV tokens (~3x SGLang!)
+    int prefix_cache_slots = 24; // Hybrid KV + GDN + DFlash2 cached prefix checkpoints in VRAM (0 = disabled)
     int decode_log_interval = 40; // SGLang-style periodic decode telemetry log interval (steps)
 };
 
@@ -116,6 +121,9 @@ struct EngineMetrics {
     std::atomic<int> waiting_requests{0};
     std::atomic<int> kv_blocks_used{0};
     std::atomic<int> kv_blocks_total{0};
+    std::atomic<int> prefix_cache_checkpoints{0};
+    std::atomic<int> prefix_cache_capacity{0};
+    std::atomic<uint64_t> total_prefix_cache_hits{0};
     std::atomic<uint64_t> total_prompt_tokens{0};
     std::atomic<uint64_t> total_cached_tokens{0};
     std::atomic<uint64_t> total_gen_tokens{0};
@@ -134,6 +142,16 @@ struct EngineMetrics {
     std::atomic<double> total_e2e_sec{0.0};
 };
 
+struct PrefixCheckpoint {
+    uint64_t id = 0;
+    uint64_t last_used_tick = 0;
+    std::vector<int32_t> tokens;         // exact committed token sequence [0..L-1]
+    std::vector<int32_t> full_kv_blocks; // L / 16 immutable shared refcounted FP8 KV blocks
+    int32_t tail_kv_block = -1;          // private refcounted partial tail block if L % 16 != 0
+    int state_slot = -1;                 // owns 1 hybrid slot (48-layer GDN + 5-layer DFlash2)
+    int logits_slot = -1;                // optional slot in d_cached_logits_ for exact 100% prompt hits
+};
+
 class Scheduler {
 public:
     EngineConfig cfg;
@@ -145,8 +163,8 @@ public:
     void start();
     void stop();
 
-    // Submit a new request (returns false if queue saturated)
-    std::shared_ptr<Request> submit(std::vector<int32_t> prompt_ids, const SamplingParams& sp);
+    // Submit a new request
+    std::shared_ptr<Request> submit(std::vector<int32_t> prompt_ids, const SamplingParams& sp, int sys_prefix_len = 0);
 
 private:
     std::thread worker_;
@@ -159,7 +177,15 @@ private:
 
     std::vector<std::shared_ptr<Request>> running_;
     std::vector<int32_t> free_kv_blocks_;
+    std::vector<int32_t> kv_block_refcnt_;
     std::vector<int32_t> free_state_slots_;
+
+    // Hybrid Radix Prefix Cache (shared refcounted FP8 KV blocks + GDN/DFlash2 state slots + exact-hit logits)
+    std::vector<PrefixCheckpoint> checkpoints_;
+    std::vector<int32_t> free_logits_slots_;
+    __nv_bfloat16* d_cached_logits_ = nullptr; // [prefix_cache_slots, VOCAB_SIZE] BF16
+    uint64_t cache_clock_ = 0;
+    uint64_t next_ckpt_id_ = 1;
 
     // Static device metadata buffers for prefill & CUDA-graphed batched decode/verify
     static constexpr int MAX_BS = 16;
@@ -220,10 +246,21 @@ private:
     void cleanup_cancelled();
     void finish_request(const std::shared_ptr<Request>& req, const std::string& reason);
     void release_request(const std::shared_ptr<Request>& req);
-    bool ensure_kv_blocks(const std::shared_ptr<Request>& req, int needed_tokens);
+
+    // Ref-counted KV block & hybrid prefix cache management
+    int32_t alloc_kv_block(uint64_t exclude_ckpt_id = 0);
+    void incref_kv_block(int32_t blk);
+    void decref_kv_block(int32_t blk);
+    bool ensure_kv_blocks(const std::shared_ptr<Request>& req, int needed_tokens, uint64_t exclude_ckpt_id = 0);
     void trim_unused_kv_blocks(const std::shared_ptr<Request>& req, int actual_tokens);
 
-    void step_prefill_one(const std::shared_ptr<Request>& req);
+    bool evict_one_checkpoint(uint64_t exclude_id = 0);
+    PrefixCheckpoint* match_prefix(const std::vector<int32_t>& prompt_ids);
+    bool has_exact_checkpoint(const int32_t* toks, int L);
+    void save_prefix_checkpoint(const std::shared_ptr<Request>& req, int L, bool save_logits, bool transfer_slot_on_finish);
+    void complete_exact_cache_hit(const std::shared_ptr<Request>& req, int logits_slot);
+
+    void step_prefill_one(const std::shared_ptr<Request>& req, bool has_active_decode);
     void step_decode_batch(const std::vector<std::shared_ptr<Request>>& batch);
 };
 

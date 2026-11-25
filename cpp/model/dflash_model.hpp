@@ -95,6 +95,8 @@ public:
         int block_size,
         cudaStream_t stream);
 
+    void copy_kv_slot(int dst_slot, int src_slot, cudaStream_t stream);
+
     void destroy();
 };
 

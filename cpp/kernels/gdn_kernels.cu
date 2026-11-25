@@ -1194,4 +1194,81 @@ void launch_gdn_chunked_prefill(
         cu_seqlens, d_cu_chunks, out, B);
 }
 
+namespace {
+
+// Single-launch float4 copy of all 48 GDN layers' SSM + conv states between two slots (~0.10 ms for 78.4 MB!)
+__global__ void copy_gdn_state_slot_kernel(
+    __nv_bfloat16* const* __restrict__ ssm_ptrs,
+    __nv_bfloat16* const* __restrict__ conv_ptrs,
+    int dst_slot,
+    int src_slot
+) {
+    constexpr size_t SSM_F4 = (size_t)48 * 128 * 128 * 2 / 16;   // 98,304 float4s per layer
+    constexpr size_t CONV_F4 = (size_t)10240 * 3 * 2 / 16;       // 3,840 float4s per layer
+    constexpr int CTAS_PER_LAYER = 16;
+
+    int layer = blockIdx.x / CTAS_PER_LAYER;
+    int sub = blockIdx.x % CTAS_PER_LAYER;
+    int tid = threadIdx.x;
+
+    float4* ssm_dst = reinterpret_cast<float4*>(ssm_ptrs[layer]) + (size_t)dst_slot * SSM_F4;
+    const float4* ssm_src = reinterpret_cast<const float4*>(ssm_ptrs[layer]) + (size_t)src_slot * SSM_F4;
+    size_t stride = (size_t)CTAS_PER_LAYER * blockDim.x;
+    for (size_t i = (size_t)sub * blockDim.x + tid; i < SSM_F4; i += stride) {
+        ssm_dst[i] = ssm_src[i];
+    }
+
+    if (sub == 0) {
+        float4* conv_dst = reinterpret_cast<float4*>(conv_ptrs[layer]) + (size_t)dst_slot * CONV_F4;
+        const float4* conv_src = reinterpret_cast<const float4*>(conv_ptrs[layer]) + (size_t)src_slot * CONV_F4;
+        for (size_t i = tid; i < CONV_F4; i += blockDim.x) {
+            conv_dst[i] = conv_src[i];
+        }
+    }
+}
+
+// Single-launch float4 copy of 1 FP8 KV block (16 tokens) across all 16 full-attn layers (~5 us for 512 KB!)
+__global__ void copy_kv_block_kernel(
+    __nv_fp8_e4m3* const* __restrict__ k_ptrs,
+    __nv_fp8_e4m3* const* __restrict__ v_ptrs,
+    int dst_block,
+    int src_block
+) {
+    constexpr size_t BLK_F4 = (size_t)Qwen35Config::KV_BLOCK_SIZE * Qwen35Config::ATTN_KV_HEADS * Qwen35Config::ATTN_HEAD_DIM / 16; // 1024
+    int layer = blockIdx.x;
+    int is_v = blockIdx.y;
+    __nv_fp8_e4m3* base = is_v ? v_ptrs[layer] : k_ptrs[layer];
+    float4* dst = reinterpret_cast<float4*>(base) + (size_t)dst_block * BLK_F4;
+    const float4* src = reinterpret_cast<const float4*>(base) + (size_t)src_block * BLK_F4;
+    for (size_t i = threadIdx.x; i < BLK_F4; i += blockDim.x) {
+        dst[i] = src[i];
+    }
+}
+
+} // namespace
+
+void launch_copy_gdn_state_slot(
+    __nv_bfloat16* const* ssm_states_ptrs,
+    __nv_bfloat16* const* conv_states_ptrs,
+    int dst_slot,
+    int src_slot,
+    cudaStream_t stream
+) {
+    if (dst_slot == src_slot) return;
+    copy_gdn_state_slot_kernel<<<Qwen35Config::NUM_GDN_LAYERS * 16, 256, 0, stream>>>(
+        ssm_states_ptrs, conv_states_ptrs, dst_slot, src_slot);
+}
+
+void launch_copy_kv_block(
+    __nv_fp8_e4m3* const* k_cache_ptrs,
+    __nv_fp8_e4m3* const* v_cache_ptrs,
+    int dst_block,
+    int src_block,
+    cudaStream_t stream
+) {
+    if (dst_block == src_block) return;
+    dim3 grid(Qwen35Config::NUM_FULL_ATTN_LAYERS, 2);
+    copy_kv_block_kernel<<<grid, 256, 0, stream>>>(k_cache_ptrs, v_cache_ptrs, dst_block, src_block);
+}
+
 } // namespace amperegen

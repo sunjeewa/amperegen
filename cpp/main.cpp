@@ -34,6 +34,8 @@ int main(int argc, char** argv) {
         else if (a == "--chunked-prefill-size" && i + 1 < argc) cfg.chunked_prefill_size = atoi(argv[++i]);
         else if (a == "--block-size" && i + 1 < argc) cfg.block_size = atoi(argv[++i]);
         else if (a == "--kv-pool-gb" && i + 1 < argc) cfg.kv_pool_bytes = (size_t)atof(argv[++i]) * 1024ULL * 1024 * 1024;
+        else if (a == "--prefix-cache-slots" && i + 1 < argc) cfg.prefix_cache_slots = atoi(argv[++i]);
+        else if (a == "--no-prefix-cache") cfg.prefix_cache_slots = 0;
         else if (a == "--decode-log-interval" && i + 1 < argc) cfg.decode_log_interval = atoi(argv[++i]);
         else if (a == "--no-spec") cfg.enable_dflash = false;
         else if (a == "--draft-bf16") cfg.draft_fp8 = false;
@@ -54,6 +56,8 @@ int main(int argc, char** argv) {
                    "  --max-running-requests N    Max concurrent requests (default: 16)\n"
                    "  --block-size N              DFlash2 spec block size 6..8 (default: 8)\n"
                    "  --kv-pool-gb GB             FP8 KV cache pool size in GB (default: 18)\n"
+                   "  --prefix-cache-slots N      Hybrid KV+GDN+DFlash2 cached prefix slots (default: 24, 0=off)\n"
+                   "  --no-prefix-cache           Disable hybrid radix prefix caching\n"
                    "  --decode-log-interval N     Periodic decode telemetry interval in steps (default: 40)\n"
                    "  --python PATH               Python binary for tokenizer sidecar (default: python3)\n"
                    "  --sidecar-script PATH       Path to sidecar/app.py (default: sidecar/app.py)\n"

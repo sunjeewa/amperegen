@@ -328,6 +328,10 @@ void HttpServer::handle_metrics(int fd) {
     double e2e_sum = sched_.metrics.total_e2e_sec.load();
     double last_ttft = sched_.metrics.last_ttft_sec.load();
 
+    int pc_ckpts = sched_.metrics.prefix_cache_checkpoints.load();
+    uint64_t pc_hits = sched_.metrics.total_prefix_cache_hits.load();
+    double cache_hit_ratio = prompt_tot > 0 ? (double)cached_tot / (double)prompt_tot : 0.0;
+
     std::string lbl = "{model_name=" + Json::escape(sched_.cfg.served_model_name) + "}";
 
     // Native amperegen Prometheus metrics
@@ -337,6 +341,12 @@ void HttpServer::handle_metrics(int fd) {
         << "amperegen_waiting_requests" << lbl << " " << waiting << "\n"
         << "# TYPE amperegen_kv_cache_usage_ratio gauge\n"
         << "amperegen_kv_cache_usage_ratio" << lbl << " " << kv_ratio << "\n"
+        << "# TYPE amperegen_prefix_cache_checkpoints gauge\n"
+        << "amperegen_prefix_cache_checkpoints" << lbl << " " << pc_ckpts << "\n"
+        << "# TYPE amperegen_prefix_cache_hit_ratio gauge\n"
+        << "amperegen_prefix_cache_hit_ratio" << lbl << " " << cache_hit_ratio << "\n"
+        << "# TYPE amperegen_prefix_cache_hits_total counter\n"
+        << "amperegen_prefix_cache_hits_total" << lbl << " " << pc_hits << "\n"
         << "# TYPE amperegen_prefill_throughput_toks_per_sec gauge\n"
         << "amperegen_prefill_throughput_toks_per_sec" << lbl << " " << pp_tps << "\n"
         << "# TYPE amperegen_gen_throughput_toks_per_sec gauge\n"
@@ -439,6 +449,7 @@ void HttpServer::handle_completions(int fd, const std::string& body, bool is_cha
     // Tokenize via sidecar
     std::vector<int32_t> prompt_ids;
     bool start_in_think = false;
+    int sys_prefix_len = 0;
     bool enable_tool_parsing = false;
     Json effective_tools;
     const Json* effective_tools_ptr = nullptr;
@@ -492,7 +503,7 @@ void HttpServer::handle_completions(int fd, const std::string& body, bool is_cha
                 merged_ctk["enable_thinking"] = req_json.at("enable_thinking").as_bool();
             }
             const Json* ctk_ptr = merged_ctk.as_object().empty() ? nullptr : &merged_ctk;
-            prompt_ids = sidecar_.render_chat(req_json.at("messages"), effective_tools_ptr, ctk_ptr, &start_in_think);
+            prompt_ids = sidecar_.render_chat(req_json.at("messages"), effective_tools_ptr, ctk_ptr, &start_in_think, &sys_prefix_len);
         } else {
             if (!req_json.contains("prompt")) {
                 send_json_error(fd, 400, "Bad Request", "Missing prompt field");
@@ -522,6 +533,7 @@ void HttpServer::handle_completions(int fd, const std::string& body, bool is_cha
     if ((int)prompt_ids.size() >= max_ctx) {
         if (sched_.cfg.allow_auto_truncate) {
             prompt_ids.erase(prompt_ids.begin(), prompt_ids.begin() + ((int)prompt_ids.size() - (max_ctx - 2)));
+            sys_prefix_len = 0;
         } else {
             send_json_error(fd, 422, "Unprocessable Entity", "Prompt exceeds context_length");
             return;
@@ -562,7 +574,7 @@ void HttpServer::handle_completions(int fd, const std::string& body, bool is_cha
     }
 
     int prompt_tokens = (int)prompt_ids.size();
-    auto req = sched_.submit(std::move(prompt_ids), sp);
+    auto req = sched_.submit(std::move(prompt_ids), sp, sys_prefix_len);
     std::string req_id = (is_chat ? "chatcmpl-" : "cmpl-") + std::to_string(req->id);
     int64_t created = std::chrono::duration_cast<std::chrono::seconds>(
         std::chrono::system_clock::now().time_since_epoch()).count();

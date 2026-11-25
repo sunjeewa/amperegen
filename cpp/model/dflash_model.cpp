@@ -253,6 +253,22 @@ void DFlash2Model::propose_candidates(
         B, block_size, stream);
 }
 
+void DFlash2Model::copy_kv_slot(int dst_slot, int src_slot, cudaStream_t stream) {
+    if (dst_slot == src_slot) return;
+    size_t slot_elems = (size_t)DFlash2Config::SLIDING_WINDOW * DFlash2Config::NUM_KV_HEADS * DFlash2Config::HEAD_DIM;
+    size_t slot_bytes = slot_elems * sizeof(__nv_bfloat16);
+    for (int L = 0; L < DFlash2Config::NUM_LAYERS; ++L) {
+        CUDA_CHECK(cudaMemcpyAsync(
+            kv_pool.k_cache[L] + (size_t)dst_slot * slot_elems,
+            kv_pool.k_cache[L] + (size_t)src_slot * slot_elems,
+            slot_bytes, cudaMemcpyDeviceToDevice, stream));
+        CUDA_CHECK(cudaMemcpyAsync(
+            kv_pool.v_cache[L] + (size_t)dst_slot * slot_elems,
+            kv_pool.v_cache[L] + (size_t)src_slot * slot_elems,
+            slot_bytes, cudaMemcpyDeviceToDevice, stream));
+    }
+}
+
 void DFlash2Model::destroy() {
     ws.arena.release();
     kv_pool.arena.release();

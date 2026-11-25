@@ -468,4 +468,19 @@ void launch_slice_pred_hidden(
     int block_size,
     cudaStream_t stream);
 
+// Hybrid prefix cache fast single-launch D2D state & KV block copies
+void launch_copy_gdn_state_slot(
+    __nv_bfloat16* const* ssm_states_ptrs,   // [48]
+    __nv_bfloat16* const* conv_states_ptrs,  // [48]
+    int dst_slot,
+    int src_slot,
+    cudaStream_t stream);
+
+void launch_copy_kv_block(
+    __nv_fp8_e4m3* const* k_cache_ptrs,      // [16]
+    __nv_fp8_e4m3* const* v_cache_ptrs,      // [16]
+    int dst_block,
+    int src_block,
+    cudaStream_t stream);
+
 } // namespace amperegen

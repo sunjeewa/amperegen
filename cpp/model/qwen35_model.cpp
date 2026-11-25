@@ -126,6 +126,8 @@ void Qwen35Model::init_workspace_and_pools(
     pools.d_ba_verify_ptrs = pools.verify_arena.alloc_typed<__nv_bfloat16*>(48);
     pools.d_A_log_ptrs = pools.verify_arena.alloc_typed<float*>(48);
     pools.d_dt_bias_ptrs = pools.verify_arena.alloc_typed<float*>(48);
+    pools.d_k_cache_ptrs = pools.verify_arena.alloc_typed<__nv_fp8_e4m3*>(Qwen35Config::NUM_FULL_ATTN_LAYERS);
+    pools.d_v_cache_ptrs = pools.verify_arena.alloc_typed<__nv_fp8_e4m3*>(Qwen35Config::NUM_FULL_ATTN_LAYERS);
 
     float* h_alog[48];
     float* h_dt[48];
@@ -140,6 +142,8 @@ void Qwen35Model::init_workspace_and_pools(
     CUDA_CHECK(cudaMemcpyAsync(pools.d_ba_verify_ptrs, pools.ba_verify, 48 * sizeof(void*), cudaMemcpyHostToDevice, ctx.stream));
     CUDA_CHECK(cudaMemcpyAsync(pools.d_A_log_ptrs, h_alog, 48 * sizeof(void*), cudaMemcpyHostToDevice, ctx.stream));
     CUDA_CHECK(cudaMemcpyAsync(pools.d_dt_bias_ptrs, h_dt, 48 * sizeof(void*), cudaMemcpyHostToDevice, ctx.stream));
+    CUDA_CHECK(cudaMemcpyAsync(pools.d_k_cache_ptrs, pools.k_cache, Qwen35Config::NUM_FULL_ATTN_LAYERS * sizeof(void*), cudaMemcpyHostToDevice, ctx.stream));
+    CUDA_CHECK(cudaMemcpyAsync(pools.d_v_cache_ptrs, pools.v_cache, Qwen35Config::NUM_FULL_ATTN_LAYERS * sizeof(void*), cudaMemcpyHostToDevice, ctx.stream));
     CUDA_CHECK(cudaStreamSynchronize(ctx.stream));
 
     fprintf(stderr, "[target] Pools initialized: KV=%d blocks (%d tokens, %.2f GB), GDN=%d slots (%.2f GB), WS=%.2f GB, Verify=%.2f GB\n",
@@ -157,6 +161,14 @@ void Qwen35Model::reset_state_slot(int slot, cudaStream_t stream) {
             pools.conv_states[l] + (size_t)slot * 10240 * 3,
             0, (size_t)10240 * 3 * 2, stream));
     }
+}
+
+void Qwen35Model::copy_gdn_state_slot(int dst_slot, int src_slot, cudaStream_t stream) {
+    launch_copy_gdn_state_slot(pools.d_ssm_states_ptrs, pools.d_conv_states_ptrs, dst_slot, src_slot, stream);
+}
+
+void Qwen35Model::copy_kv_block(int dst_block, int src_block, cudaStream_t stream) {
+    launch_copy_kv_block(pools.d_k_cache_ptrs, pools.d_v_cache_ptrs, dst_block, src_block, stream);
 }
 
 void Qwen35Model::forward_layer_prefill(

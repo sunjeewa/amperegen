@@ -10,6 +10,7 @@ Compared against **SGLang 0.5.20** on the same CMP 170HX (210 W cap):
 - **+18–41% faster single-stream decode** (`89–192 tok/s` across short → 32K context)
 - **1.25–5.5× faster TTFT** and **+22.4% higher batched throughput** (`4× 1K`)
 - **2.95× larger FP8 KV cache pool** (`589,824` tokens in 18 GB vs `200,211`) and **16 concurrent requests** (vs SGLang's 7-request mamba state cap)
+- **Hybrid Radix Prefix Caching**: Ref-counted FP8 KV block sharing + 48-layer GDN SSM/conv state + 5-layer DFlash2 ring buffer + exact-hit logits cache (drops multi-turn 18K TTFT from `8.70 s` → **`0.065–0.16 s`**)
 - Full OpenAI-compatible HTTP/SSE API with **Qwen3 `<think>` reasoning split**, **`qwen3_coder` XML streaming/non-streaming tool calling**, and **SGLang-compatible Prometheus telemetry**
 
 See [docs/BENCHMARK.md](docs/BENCHMARK.md) for full measured numbers and [DESIGN.md](DESIGN.md) for deep architecture notes.
@@ -25,7 +26,7 @@ See [docs/BENCHMARK.md](docs/BENCHMARK.md) for full measured numbers and [DESIGN
 | **Gated DeltaNet (GDN)** | `cpp/kernels/gdn_kernels.cu` | Tensor Core Chunk-64 WY prefill (`4.15 ms/layer` @ `T=8192`), `BV=32` 192-CTA decode, single-launch Replay-Commit verify across 48 layers |
 | **DFlash2 Draft & Verify** | `cpp/kernels/dflash_kernels.cu`, `cpp/model/dflash_model.cpp` | FP8 draft weights + FP8 draft `lm_head` (lossless for exact BF16 target verify), Tensor Core Split-K=16 bidirectional sliding-window attention, exact speculative rejection sampling |
 | **Direct `mmap` Weight Loader** | `cpp/loader/safetensors.cpp`, `cpp/loader/model_loader.cpp` | Zero-copy `mmap`, sliding-window background prefetch, single `GpuArena`, pinned staging DMA, on-GPU MMA packing & FP8 quantization |
-| **Continuous-Batch Scheduler** | `cpp/scheduler/scheduler.cpp` | Chunked prefill (8K), paged FP8 KV pool (`589,824` tokens in 18 GB), single CUDA Graph per batch size (greedy & sampling), live PP/TG telemetry |
+| **Continuous-Batch Scheduler & Prefix Cache** | `cpp/scheduler/scheduler.cpp` | Adaptive chunked prefill, ref-counted FP8 KV pool (`589,824` tokens), 24-slot hybrid KV+GDN+DFlash2 prefix cache with exact-hit logits, single CUDA Graph per batch size (greedy & sampling), live PP/TG telemetry |
 | **OpenAI HTTP/SSE Server** | `cpp/server/http_server.cpp`, `cpp/server/tool_parser.hpp`, `sidecar/app.py` | `/v1/chat/completions`, `/v1/completions`, `/v1/models`, `/health`, `/metrics`, `/get_server_info`, Qwen3 `<think>` split, `qwen3_coder` streaming/non-streaming tool calls, exact HF Jinja chat template sidecar |
 
 ---
@@ -135,7 +136,7 @@ journalctl -u amperegen -f
 ## Current Scope & Roadmap
 
 - **Hardcoded model geometry**: Dimensions in `cpp/model/model_config.hpp` are compile-time specialized for `Qwen3.8-27B-FP8` + `Qwen3.8-27B-DFlash2` on `sm_80` to maximize kernel fusion and occupancy.
-- **No hybrid radix prefix caching yet**: Multi-turn sessions currently re-prefill shared prefixes; hybrid KV + GDN + DFlash2 prefix state caching is planned next.
+- **VRAM prefix cache**: Hybrid prefix checkpoints (KV + GDN + DFlash2) are stored in GPU HBM with automatic LRU eviction and `cudaMemGetInfo` safety clamping (`--prefix-cache-slots`, default `24`); host-RAM spillover for hundreds of cold sessions is a potential future extension.
 
 ---
 

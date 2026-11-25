@@ -78,7 +78,13 @@ public:
         return extract_ids(resp);
     }
 
-    std::vector<int32_t> render_chat(const Json& messages, const Json* tools, const Json* kwargs, bool* out_in_think = nullptr) {
+    std::vector<int32_t> render_chat(
+        const Json& messages,
+        const Json* tools,
+        const Json* kwargs,
+        bool* out_in_think = nullptr,
+        int* out_sys_prefix_len = nullptr
+    ) {
         Json req;
         req["op"] = "render_chat";
         req["messages"] = messages;
@@ -88,6 +94,9 @@ public:
         Json resp = rpc(req);
         if (out_in_think != nullptr) {
             *out_in_think = resp.contains("in_think") && resp.at("in_think").as_bool(false);
+        }
+        if (out_sys_prefix_len != nullptr) {
+            *out_sys_prefix_len = resp.contains("sys_prefix_len") ? (int)resp.at("sys_prefix_len").as_int(0) : 0;
         }
         return extract_ids(resp);
     }

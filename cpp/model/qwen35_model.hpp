@@ -37,7 +37,7 @@ struct TargetStatePools {
     int max_verify_bs = 0;
     int max_block_size = 0;
 
-    // Device pointer tables [48] for single-launch commit_replay!
+    // Device pointer tables [48] for single-launch commit_replay & [16] for KV block copy!
     __nv_bfloat16** d_ssm_states_ptrs = nullptr;
     __nv_bfloat16** d_conv_states_ptrs = nullptr;
     __nv_bfloat16** d_conv_inter_ptrs = nullptr;
@@ -45,6 +45,8 @@ struct TargetStatePools {
     __nv_bfloat16** d_ba_verify_ptrs = nullptr;
     float** d_A_log_ptrs = nullptr;
     float** d_dt_bias_ptrs = nullptr;
+    __nv_fp8_e4m3** d_k_cache_ptrs = nullptr;
+    __nv_fp8_e4m3** d_v_cache_ptrs = nullptr;
 };
 
 struct TargetWorkspace {
@@ -98,6 +100,8 @@ public:
         size_t kv_pool_bytes);
 
     void reset_state_slot(int slot, cudaStream_t stream);
+    void copy_gdn_state_slot(int dst_slot, int src_slot, cudaStream_t stream);
+    void copy_kv_block(int dst_block, int src_block, cudaStream_t stream);
 
     // Run a single decoder layer (for Stage-1 verification!)
     void forward_layer_prefill(
