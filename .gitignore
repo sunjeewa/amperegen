@@ -1,0 +1,22 @@
+# Build outputs
+build/
+*.o
+*.obj
+*.a
+*.so
+*.dylib
+*.out
+
+# Python / sidecar
+__pycache__/
+*.py[cod]
+.venv/
+
+# Runtime / OS / Editor
+*.sock
+*.log
+.DS_Store
+.vscode/
+.idea/
+*.swp
+*~
