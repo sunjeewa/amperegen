@@ -11,7 +11,7 @@ A dedicated C++20 + CUDA (`sm_80`) LLM inference engine for **NVIDIA Ampere 64 G
 
 | Metric | SGLang 0.5.20 | `amperegen` |
 |---|---|---|
-| **Cold startup to ready** | ~7 min | **~20 s** |
+| **Warm startup to ready** | ~34 s | **~20 s** |
 | **Single-stream decode (TG)** | ~75–135 tok/s | **~90–190 tok/s** |
 | **Uncached prefill (PP)** | ~1,190 tok/s | **~2,260 tok/s** |
 | **Multi-turn TTFT (cached 18K ctx)** | < 1 s | **0.07–0.2 s** |
