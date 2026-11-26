@@ -3,17 +3,23 @@
 [![CI](https://github.com/sunjeewa/amperegen/actions/workflows/ci.yml/badge.svg)](https://github.com/sunjeewa/amperegen/actions/workflows/ci.yml)
 [![License: Apache-2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
 
-Dedicated C++20 + CUDA (`sm_80`) LLM inference engine built specifically for **NVIDIA Ampere (`sm_80`) 64 GB+ GPUs** (tested on **CMP 170HX 64GB**, GA100, 70 SMs, 210 W cap; also compatible with A100 80GB) serving **`Qwen3.8-27B-FP8`** (48 Gated DeltaNet + 16 Full-Attention layers) with **`Qwen3.8-27B-DFlash2`** speculative decoding.
+A dedicated C++20 + CUDA (`sm_80`) LLM inference engine for **NVIDIA Ampere 64 GB+ GPUs** (CMP 170HX 64GB, A100 80GB), specialized for **`Qwen3.8-27B-FP8`** with **`Qwen3.8-27B-DFlash2`** speculative decoding.
 
-Compared against **SGLang 0.5.20** on the same CMP 170HX (210 W cap):
-- **20.8× faster startup** (`~20 s` vs `~422 s`)
-- **+18–41% faster single-stream decode** (`89–192 tok/s` across short → 32K context)
-- **1.25–5.5× faster TTFT** and **+22.4% higher batched throughput** (`4× 1K`)
-- **2.95× larger FP8 KV cache pool** (`589,824` tokens in 18 GB vs `200,211`) and **16 concurrent requests** (vs SGLang's 7-request mamba state cap)
-- **Hybrid Radix Prefix Caching**: Ref-counted FP8 KV block sharing + 48-layer GDN SSM/conv state + 5-layer DFlash2 ring buffer + exact-hit logits cache (drops multi-turn 18K TTFT from `8.70 s` → **`0.065–0.16 s`**)
-- Full OpenAI-compatible HTTP/SSE API with **Qwen3 `<think>` reasoning split**, **`qwen3_coder` XML streaming/non-streaming tool calling**, and **SGLang-compatible Prometheus telemetry**
+---
 
-See [docs/BENCHMARK.md](docs/BENCHMARK.md) for full measured numbers and [DESIGN.md](DESIGN.md) for deep architecture notes.
+## Highlights (CMP 170HX 64GB @ 210 W vs SGLang 0.5.20)
+
+| Metric | SGLang 0.5.20 | `amperegen` |
+|---|---|---|
+| **Cold startup to ready** | ~7 min | **~20 s** |
+| **Single-stream decode (TG)** | ~75–135 tok/s | **~90–190 tok/s** |
+| **Uncached prefill (PP)** | ~1,190 tok/s | **~2,260 tok/s** |
+| **Multi-turn TTFT (cached 18K ctx)** | < 1 s | **0.07–0.2 s** |
+
+- **Hybrid Radix Prefix Caching**: Reuses FP8 KV blocks, Gated DeltaNet recurrent states, DFlash2 sliding-window KV, and exact-hit logits across multi-turn conversations and shared system prompts.
+- **OpenAI-Compatible HTTP/SSE API**: Drop-in `/v1/chat/completions` and `/v1/completions` with Qwen3 `<think>` reasoning split, streaming/non-streaming `qwen3_coder` tool calling, and SGLang-compatible Prometheus `/metrics`.
+
+For full benchmark tables and kernel-level measurements, see [docs/BENCHMARK.md](docs/BENCHMARK.md) and [DESIGN.md](DESIGN.md).
 
 ---
 
@@ -21,29 +27,29 @@ See [docs/BENCHMARK.md](docs/BENCHMARK.md) for full measured numbers and [DESIGN
 
 | Component | Path | Highlights |
 |---|---|---|
-| **FP8 Block-128×128 GEMM (K1 v3)** | `cpp/kernels/fp8_gemm.cu` | Exact bitwise FP8→BF16 unpack (`×2^120` fused scale), 3-stage `cp.async`, `M_TILES∈{1,2,4}` (`M≤64`, up to 1,565 GB/s), coalesced 256 B unpack + cuBLAS BF16 (~188 TFLOPS) for prefill |
-| **Paged FP8 FlashDecoding & FA2** | `cpp/kernels/flash_attn.cu` | GQA-6× Tensor Core `mma.m16n8k16` + `ldmatrix.x4(.trans)` + XOR-swizzled smem + `exp2f` + bitwise FP8 KV unpack (`+2.84 ms` across 16 layers at 32K ctx) |
-| **Gated DeltaNet (GDN)** | `cpp/kernels/gdn_kernels.cu` | Tensor Core Chunk-64 WY prefill (`4.15 ms/layer` @ `T=8192`), `BV=32` 192-CTA decode, single-launch Replay-Commit verify across 48 layers |
-| **DFlash2 Draft & Verify** | `cpp/kernels/dflash_kernels.cu`, `cpp/model/dflash_model.cpp` | FP8 draft weights + FP8 draft `lm_head` (lossless for exact BF16 target verify), Tensor Core Split-K=16 bidirectional sliding-window attention, exact speculative rejection sampling |
-| **Direct `mmap` Weight Loader** | `cpp/loader/safetensors.cpp`, `cpp/loader/model_loader.cpp` | Zero-copy `mmap`, sliding-window background prefetch, single `GpuArena`, pinned staging DMA, on-GPU MMA packing & FP8 quantization |
-| **Continuous-Batch Scheduler & Prefix Cache** | `cpp/scheduler/scheduler.cpp` | Adaptive chunked prefill, ref-counted FP8 KV pool (`589,824` tokens), 24-slot hybrid KV+GDN+DFlash2 prefix cache with exact-hit logits, single CUDA Graph per batch size (greedy & sampling), live PP/TG telemetry |
-| **OpenAI HTTP/SSE Server** | `cpp/server/http_server.cpp`, `cpp/server/tool_parser.hpp`, `sidecar/app.py` | `/v1/chat/completions`, `/v1/completions`, `/v1/models`, `/health`, `/metrics`, `/get_server_info`, Qwen3 `<think>` split, `qwen3_coder` streaming/non-streaming tool calls, exact HF Jinja chat template sidecar |
+| **FP8 GEMM** | `cpp/kernels/fp8_gemm.cu` | Custom `sm_80` block-scaled FP8 Tensor Core GEMM for decode (`cp.async` + bitwise FP8→BF16 unpack), coalesced dequant + cuBLAS BF16 for prefill |
+| **Paged FP8 Attention** | `cpp/kernels/flash_attn.cu` | GQA-packed Tensor Core FlashDecoding & FlashAttention-2 with XOR-swizzled shared memory and bitwise FP8 KV unpack |
+| **Gated DeltaNet (GDN)** | `cpp/kernels/gdn_kernels.cu` | Tensor Core chunked WY prefill, fused recurrent decode, and zero-snapshot Replay-Commit speculative verification |
+| **DFlash2 Speculative Decoding** | `cpp/kernels/dflash_kernels.cu`, `cpp/model/dflash_model.cpp` | FP8 draft model + FP8 draft `lm_head` (verified by exact BF16 target), bidirectional sliding-window attention, exact rejection sampling |
+| **Direct Weight Loader** | `cpp/loader/safetensors.cpp`, `cpp/loader/model_loader.cpp` | Zero-copy `mmap` safetensors reader with background prefetch, pinned DMA staging, and on-GPU weight packing |
+| **Scheduler & Prefix Cache** | `cpp/scheduler/scheduler.cpp` | Continuous batching, adaptive chunked prefill, ref-counted hybrid KV+GDN+DFlash2 prefix cache, single CUDA Graph per batch size |
+| **OpenAI HTTP/SSE Server** | `cpp/server/http_server.cpp`, `cpp/server/tool_parser.hpp`, `sidecar/app.py` | Reasoning split, `qwen3_coder` XML tool-call parser with JSON Schema typing, HF Jinja chat-template sidecar, live PP/TG telemetry |
 
 ---
 
 ## Requirements
 
-- **GPU**: NVIDIA Ampere (`sm_80`) with ≥ 64 GB VRAM (e.g. CMP 170HX 64GB, A100 80GB)
-- **Toolchain**: CUDA Toolkit 12.x (`nvcc`, `cublas`, `cublasLt`), C++20 compiler (`g++` or `clang++`), CMake ≥ 3.24, Ninja
-- **Python 3.10+** for the lightweight tokenizer/chat-template sidecar (`sidecar/requirements.txt`)
-- **Model checkpoints**: `Qwen3.8-27B-FP8` (target) and optionally `Qwen3.8-27B-DFlash2` (speculative draft)
+- **GPU**: NVIDIA Ampere (`sm_80`) with ≥ 64 GB VRAM (e.g., CMP 170HX 64GB, A100 80GB)
+- **Toolchain**: CUDA Toolkit 12.x, C++20 compiler, CMake ≥ 3.22, Ninja
+- **Python 3.10+** for the tokenizer/chat-template sidecar (`sidecar/requirements.txt`)
+- **Model checkpoints**: `Qwen3.8-27B-FP8` (target) and optionally `Qwen3.8-27B-DFlash2` (draft)
 
 ---
 
 ## Building
 
 ```bash
-# 1. Build the C++20 / CUDA binaries (-DAMPEREGEN_PORTABLE=ON for portable x86-64-v3 builds)
+# 1. Build binaries (add -DAMPEREGEN_PORTABLE=ON for portable x86-64-v3 builds)
 cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
 ninja -C build amperegen amperegen_test amperegen_unit_tests
 
@@ -55,7 +61,7 @@ python3 -m venv .venv
 .venv/bin/pip install -r sidecar/requirements.txt
 ```
 
-Prebuilt Linux `x86_64` CUDA 12.8 (`sm_80`) release tarballs are published automatically on `v*` git tags via [GitHub Releases](https://github.com/sunjeewa/amperegen/releases).
+Prebuilt Linux `x86_64` CUDA 12.8 (`sm_80`) tarballs are published on version tags via [GitHub Releases](https://github.com/sunjeewa/amperegen/releases).
 
 <details>
 <summary>Note for Fedora 44 (GCC 15 + CUDA 12.8)</summary>
@@ -73,7 +79,7 @@ ninja -C build amperegen amperegen_test
 
 ---
 
-## Running the OpenAI-Compatible Server
+## Running the Server
 
 ```bash
 ./build/amperegen \
@@ -81,21 +87,14 @@ ninja -C build amperegen amperegen_test
   --draft-path /path/to/models/Qwen3.8-27B-DFlash2 \
   --served-model-name Qwen3.8-27B-FP8 \
   --host 0.0.0.0 --port 8000 \
-  --context-length 200000 \
-  --max-running-requests 16 \
-  --block-size 8 \
-  --kv-pool-gb 18 \
   --python ./.venv/bin/python \
   --sidecar-script ./sidecar/app.py
 ```
 
-### Supported Endpoints & Features
-- **`POST /v1/chat/completions`** (streaming SSE & non-streaming, `Transfer-Encoding: chunked` supported):
-  - Automatic Qwen3 `<think>...</think>` reasoning split into `reasoning_content` / `content`
-  - Native `qwen3_coder` XML tool-call parsing (`<tool_call><function=...><parameter=...>`) with JSON Schema type conversion into OpenAI `tool_calls` and `finish_reason: "tool_calls"`
-  - Multi-turn conversation normalization (`developer` → `system`, assistant `tool_calls` arguments normalization, `reasoning_effort` & `tool_choice`)
+### API & Telemetry
+- **`POST /v1/chat/completions`** (streaming SSE & non-streaming): automatic `<think>` reasoning split (`reasoning_content` / `content`), `qwen3_coder` XML tool calling (`tool_calls`), multi-turn normalization (`developer` role, `tool_choice`, `reasoning_effort`).
 - **`POST /v1/completions`**, **`GET /v1/models`**, **`GET /health`**
-- **`GET /metrics`** & **`GET /get_server_info`**: Prometheus metrics exposing both `amperegen_*` and SGLang-compatible `sglang:*` telemetry (`prefill_throughput`, `gen_throughput`, `spec_accept_length`, `spec_accept_rate`, token & request counters), plus live PP/TG logs on stderr.
+- **`GET /metrics`** & **`GET /get_server_info`**: Prometheus metrics (both `amperegen_*` and SGLang-compatible `sglang:*` counters/gauges) plus live per-batch and per-request PP/TG logs on stderr.
 
 ### Running as a `systemd` Service
 
@@ -108,7 +107,7 @@ sudo systemctl enable --now amperegen
 journalctl -u amperegen -f
 ```
 
-> **SELinux (Fedora/RHEL):** If installing under `/home` rather than `/usr/local/bin` or `/opt`, label the binary `bin_t` so systemd can execute it:
+> **SELinux (Fedora/RHEL):** If installing under `/home` rather than `/opt` or `/usr/local/bin`, label the binary `bin_t` so systemd can execute it:
 > ```bash
 > sudo semanage fcontext -a -t bin_t '/path/to/amperegen/build/amperegen'
 > sudo restorecon -v /path/to/amperegen/build/amperegen
@@ -119,24 +118,24 @@ journalctl -u amperegen -f
 ## Verification & Benchmarking
 
 ```bash
-# Stage-1: Generate PyTorch golden vectors and verify per-layer numerics
+# Stage-1: Per-layer numerical verification against pure-PyTorch reference
 .venv/bin/python ref/torch_ref.py --model-dir /path/to/models/Qwen3.8-27B-FP8 --seq-len 150 --out-dir ref/stage1_150
 ./build/amperegen_test --stage1 --model-dir /path/to/models/Qwen3.8-27B-FP8 --ref-dir ref/stage1_150
 
-# Stage-2/3: Core breakdown + nospec + DFlash2 (b=6 & b=8) suite
+# Stage-2/3: Core latency breakdown + speculative suite
 .venv/bin/python tools/prep_prompts.py --prep --model-dir /path/to/models/Qwen3.8-27B-FP8
 ./build/amperegen_test --suite --model-dir /path/to/models/Qwen3.8-27B-FP8 --draft-dir /path/to/models/Qwen3.8-27B-DFlash2
 
-# End-to-end HTTP/SSE server validation & benchmark
+# End-to-end HTTP/SSE server benchmark
 .venv/bin/python tools/bench_amperegen.py --base-url http://127.0.0.1:8000
 ```
 
 ---
 
-## Current Scope & Roadmap
+## Current Scope
 
-- **Hardcoded model geometry**: Dimensions in `cpp/model/model_config.hpp` are compile-time specialized for `Qwen3.8-27B-FP8` + `Qwen3.8-27B-DFlash2` on `sm_80` to maximize kernel fusion and occupancy.
-- **VRAM prefix cache**: Hybrid prefix checkpoints (KV + GDN + DFlash2) are stored in GPU HBM with automatic LRU eviction and `cudaMemGetInfo` safety clamping (`--prefix-cache-slots`, default `24`); host-RAM spillover for hundreds of cold sessions is a potential future extension.
+- **Model specialization**: Layer geometry in `cpp/model/model_config.hpp` is compile-time specialized for `Qwen3.8-27B-FP8` + `Qwen3.8-27B-DFlash2` on `sm_80`.
+- **VRAM prefix cache**: Hybrid prefix checkpoints live in GPU HBM with automatic LRU eviction and VRAM headroom clamping (`--prefix-cache-slots`, `--no-prefix-cache`).
 
 ---
 
