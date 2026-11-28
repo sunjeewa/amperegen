@@ -21,3 +21,11 @@ __pycache__/
 .idea/
 *.swp
 *~
+
+# Local host-specific configs (systemd units, build scripts, notes)
+local/
+*.local
+
+# Generated reference binaries
+ref/prompts/
+ref/stage1*/
