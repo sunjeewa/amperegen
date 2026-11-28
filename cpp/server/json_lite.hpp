@@ -1,5 +1,5 @@
 #pragma once
-// Minimal zero-dependency C++20 JSON DOM parser & serializer for amperegen HTTP server & sidecar IPC.
+// Minimal zero-dependency C++20 JSON DOM parser & serializer for amperegen HTTP server.
 #include <cctype>
 #include <cmath>
 #include <cstdint>

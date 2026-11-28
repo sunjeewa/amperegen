@@ -5,7 +5,7 @@
 
 A standalone C++20 and CUDA (`sm_80`) inference engine for running **[Qwen3.8-27B](https://huggingface.co/Qwen/Qwen3.8-27B)** with **[DFlash2](https://huggingface.co/Qwen/Qwen3.8-27B-DFlash2)** speculative decoding on **NVIDIA Ampere 64GB+ GPUs** (CMP 170HX 64GB, A100 80GB). Tokenization, Jinja chat templates, inference, and the OpenAI HTTP/SSE server all run in a single native binary.
 
-Compared to SGLang 0.5.20 on a CMP 170HX 64GB, `amperegen` boots faster (~20s vs ~34s warm), decodes faster, fits up to 3× more KV cache, and handles 16 concurrent requests instead of 7. See [docs/BENCHMARK.md](docs/BENCHMARK.md) for benchmarks and [DESIGN.md](DESIGN.md) for technical details.
+Compared to SGLang 0.5.20 on a CMP 170HX 64GB, `amperegen` boots faster (~20s vs ~34s warm), decodes faster, fits up to 3× more KV cache, and handles 16 concurrent requests instead of 7. See [docs/BENCHMARK.md](docs/BENCHMARK.md) for measured numbers.
 
 ## Supported Models
 
@@ -53,7 +53,7 @@ Quick sizing guide:
 
 ```bash
 cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
-ninja -C build amperegen amperegen_test amperegen_bpe_detok_tests amperegen_tokenizer_tests
+ninja -C build amperegen amperegen_test amperegen_unit_tests amperegen_bpe_detok_tests amperegen_tokenizer_tests
 ```
 
 To build with only one weight plugin (for example INT4 only):
@@ -105,9 +105,10 @@ sudo restorecon -v /path/to/amperegen/build/amperegen
 ## Tests & Benchmarks
 
 ```bash
-# Native tokenizer & minja chat-template unit tests (CPU-only)
-./build/amperegen_tokenizer_tests
+# CPU-only unit tests (tool parser, BPE detokenizer, native tokenizer + minja)
+./build/amperegen_unit_tests
 ./build/amperegen_bpe_detok_tests
+./build/amperegen_tokenizer_tests
 
 # GPU self-tests for all compiled weight plugins
 ./build/amperegen_test --test-weights

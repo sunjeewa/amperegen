@@ -32,6 +32,22 @@ Measured end-to-end on an **NVIDIA CMP 170HX 64GB** (GA100 `sm_80`, 70 SMs, 32 M
 
 ---
 
+## 1b. Weight Plugin Comparison: Official FP8 vs RedHatAI INT4 (`b=8`, HTTP/SSE)
+
+Measured live on the same CMP 170HX 64GB serving `Qwen/Qwen3.8-27B-FP8` (`qwen_fp8`) vs `RedHatAI/Qwen3.8-27B-INT4` (`redhat_int4`) with `Qwen/Qwen3.8-27B-DFlash2`:
+
+| Metric | `qwen_fp8` (W8A16 block-128) | `redhat_int4` (W4A16 group-128) | Delta |
+|---|---:|---:|---:|
+| **Target Weights VRAM** (incl. FP8 draft `lm_head`) | `30.75 GB` | **`18.95 GB`** | **-11.80 GB (-38%)** |
+| **Step Latency** (`b=8`, CUDA Graph) | `~30.0 ms` | **`~23.7 ms`** | **1.27× faster** |
+| `code_512` (no-think) Decode | `145.1 tok/s` | **`161.9 tok/s`** | **+11.6%** |
+| `math_think` Decode | `166.6 tok/s` | **`216.2 tok/s`** | **+29.8%** |
+| `tool_call` Decode | `224.6 tok/s` | **`254.1 tok/s`** | **+13.1%** |
+| 8K Cold Prefill (PP) | `~2,260 tok/s` | **`2,394.1 tok/s`** | **+5.9%** |
+| Exact Prefix-Cache Hit Restore | `~0.20 ms` | **`0.20 ms`** | Parity |
+
+---
+
 ## 2. Per-Step Latency Breakdown (`amperegen_test --suite`)
 
 Measured via `cudaEvent` on CMP 170HX (unthrottled, 0x0):
@@ -71,8 +87,8 @@ Measured via `cudaEvent` on CMP 170HX (unthrottled, 0x0):
 
 ## 4. Key Architectural Wins Over SGLang on `sm_80`
 
-1. **Native Block-128×128 FP8 E4M3 Tensor Core GEMM (K1 v3)** (`cpp/kernels/fp8_gemm.cu`): Exploits exact bitwise FP8→BF16 unpacking (`fp8 * 2^-120`) fused with pre-scaled `scale_inv * 2^120` in a single `__hmul2`, 3-stage `cp.async` with hardware zero-fill, 2× N-tile/warp, and `M_TILES ∈ {1, 2, 4}` covering up to `M=64` (1,220–1,565 GB/s — eliminating Marlin's 128× scale replication). For `M > 64`, 256-byte coalesced shared-memory dequant feeds cuBLAS BF16 Tensor Cores (~188 TFLOPS).
+1. **Curated `sm_80` Weight-Only Tensor Core GEMMs** (`cpp/weights/qwen_fp8/gemm.cu`, `cpp/weights/redhat_int4/gemm.cu`): Exploits bitwise FP8→BF16 unpacking (`fp8 * 2^-120` fused with pre-scaled `scale_inv * 2^120` in a single `__hmul2`) and `lop3` INT4→BF16 unpacking with hoisted group-128 FP32 scaling, 3-stage `cp.async` with hardware zero-fill, 2× N-tile/warp, and `M_TILES ∈ {1, 2, 4}` covering up to `M=64`. For `M > 64`, 256-byte coalesced shared-memory dequant feeds cuBLAS BF16 Tensor Cores (~188 TFLOPS).
 2. **GQA-6× Packed Tensor Core FP8 Paged FlashDecoding & FlashAttention-2** (`cpp/kernels/flash_attn.cu`): Packs all 6 Q-heads × up to 8 verify tokens (48 queries) per KV-head in one pass using `ldmatrix.x4` / `ldmatrix.x4.trans`, XOR-swizzled bank-conflict-free shared memory, register-resident online softmax with single-cycle `exp2f`, and fast bitwise FP8 KV unpack (zero `sm_80` software FP8 casts).
 3. **Tensor Core Chunk-64 WY Gated DeltaNet Prefill & Replay-Commit Verify** (`cpp/kernels/gdn_kernels.cu`): All three WY prefill stages run on `mma.m16n8k16` (`4.15 ms/layer` at `T=8192`, 13.8× faster than scalar); speculative verify avoids allocating 9.6 GB of intermediate SSM states by replaying only `commit_lens[b]` accepted steps across all 48 layers in a single kernel launch (~0.3–0.6 ms).
 4. **Full Single-CUDA-Graph DFlash2 Speculative Loop** (`cpp/model/dflash_model.cpp`, `cpp/kernels/dflash_kernels.cu`, `cpp/scheduler/scheduler.cpp`): Draft FP8 quantization + separate FP8 `lm_head` for draft proposals (100% lossless for exact BF16 target verification), Tensor Core Split-K=16 bidirectional draft attention, commit-masked ring-buffer append, and exact speculative rejection sampling captured inside one CUDA Graph per batch size (greedy and sampling alike).
-5. **Fast Direct C++ `mmap` Safetensors Loader + Thin Tokenizer Sidecar** (`cpp/loader/`, `cpp/server/`, `sidecar/app.py`): Parallel direct GPU loading + on-GPU MMA weight packing boots the full 27B + DFlash2 engine in **~20 seconds** on warm page cache (vs ~34 s warm for SGLang; cold boot on NFS is network-bound for both engines), while keeping Python strictly off the inference critical path via a persistent Unix-socket tokenizer/chat-template sidecar.
+5. **Fast Direct C++ `mmap` Safetensors Loader + Native C++20 Tokenizer & Minja Chat Templates** (`cpp/loader/`, `cpp/server/tokenizer.cpp`, `cpp/server/bpe_detokenizer.hpp`): Parallel direct GPU loading + on-GPU MMA weight packing boots the full 27B + DFlash2 engine in **~12–20 seconds** on warm page cache (vs ~34 s warm for SGLang), with tokenization (`libpcre2-8` + `libutf8proc`), Jinja chat templates (`minja`), and streaming UTF-8 detokenization all running in-process.

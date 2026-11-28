@@ -344,7 +344,7 @@ public:
             }
             if (clean_up_spaces) {
                 clear();
-                set_err(err_out, "tokenizer_config.json requests clean_up_tokenization_spaces=true (falling back to sidecar)");
+                set_err(err_out, "tokenizer_config.json requests clean_up_tokenization_spaces=true (unsupported natively)");
                 return false;
             }
             for (const auto& a : cfg_added) {

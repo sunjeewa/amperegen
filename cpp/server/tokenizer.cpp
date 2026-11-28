@@ -127,7 +127,7 @@ std::string extract_config_token(const nlohmann::json& cfg, const char* key) {
     return "";
 }
 
-// Normalize OpenAI Chat Completions messages identically to sidecar/app.py:
+// Normalize OpenAI Chat Completions messages for Jinja chat templates:
 //  - Converts `developer` role -> `system` and merges multiple system messages at index 0.
 //  - Copies `reasoning` -> `reasoning_content` fallback on assistant messages.
 //  - Parses assistant `tool_calls[].function.arguments` JSON strings into objects so

@@ -8,7 +8,7 @@ dist/
 *.dylib
 *.out
 
-# Python / sidecar
+# Python (benchmark/reference helper scripts)
 __pycache__/
 *.py[cod]
 .venv/
