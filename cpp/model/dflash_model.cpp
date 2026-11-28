@@ -104,7 +104,7 @@ void DFlash2Model::materialize_context_kv(
 
         // 1) fc: [chunk, 25600] -> [chunk, 5120], then plain RMSNorm (hidden_norm)!
         if (weights.use_fp8) {
-            launch_fp8_linear(
+            launch_quant_linear(
                 target.ctx.cublas, aux_c, weights.fc_fp8, ws.ctx_hidden,
                 target.ws.d_splitk_scratch, target.ws.d_bf16_w_scratch, chunk, stream);
         } else {
@@ -118,7 +118,7 @@ void DFlash2Model::materialize_context_kv(
         for (int L = 0; L < DFlash2Config::NUM_LAYERS; ++L) {
             const auto& lw = weights.layers[L];
             if (weights.use_fp8) {
-                launch_fp8_linear(
+                launch_quant_linear(
                     target.ctx.cublas, ws.ctx_norm, lw.kv_only_fp8, ws.ctx_kv,
                     target.ws.d_splitk_scratch, target.ws.d_bf16_w_scratch, chunk, stream);
             } else {
@@ -181,7 +181,7 @@ void DFlash2Model::propose_candidates(
 
         // QKV proj + plain QK-norm + full 128-dim RoPE + bidirectional sliding attention + O proj
         if (weights.use_fp8) {
-            launch_fp8_linear(target.ctx.cublas, ws.conv_buf, lw.qkv_fp8, ws.qkv_buf, target.ws.d_splitk_scratch, target.ws.d_bf16_w_scratch, total_T, stream);
+            launch_quant_linear(target.ctx.cublas, ws.conv_buf, lw.qkv_fp8, ws.qkv_buf, target.ws.d_splitk_scratch, target.ws.d_bf16_w_scratch, total_T, stream);
         } else {
             launch_bf16_linear(target.ctx.cublas, ws.conv_buf, lw.qkv_bf16, ws.qkv_buf, total_T, DFlash2Config::QKV_DIM, DFlash2Config::HIDDEN_SIZE, stream, false);
         }
@@ -190,7 +190,7 @@ void DFlash2Model::propose_candidates(
             ws.qkv_buf, kv_pool.k_cache[L], kv_pool.v_cache[L], d_draft_slots, d_prefix_lens,
             ws.attn_out, ws.attn_split_out, ws.attn_split_lse, B, block_size, stream);
         if (weights.use_fp8) {
-            launch_fp8_linear(target.ctx.cublas, ws.attn_out, lw.o_fp8, ws.conv_buf, target.ws.d_splitk_scratch, target.ws.d_bf16_w_scratch, total_T, stream);
+            launch_quant_linear(target.ctx.cublas, ws.attn_out, lw.o_fp8, ws.conv_buf, target.ws.d_splitk_scratch, target.ws.d_bf16_w_scratch, total_T, stream);
         } else {
             launch_bf16_linear(target.ctx.cublas, ws.attn_out, lw.o_bf16, ws.conv_buf, total_T, DFlash2Config::HIDDEN_SIZE, DFlash2Config::Q_DIM, stream, false);
         }
@@ -207,13 +207,13 @@ void DFlash2Model::propose_candidates(
 
         // MLP SwiGLU
         if (weights.use_fp8) {
-            launch_fp8_linear(target.ctx.cublas, ws.conv_buf, lw.gate_up_fp8, ws.gate_up_buf, target.ws.d_splitk_scratch, target.ws.d_bf16_w_scratch, total_T, stream);
+            launch_quant_linear(target.ctx.cublas, ws.conv_buf, lw.gate_up_fp8, ws.gate_up_buf, target.ws.d_splitk_scratch, target.ws.d_bf16_w_scratch, total_T, stream);
         } else {
             launch_bf16_linear(target.ctx.cublas, ws.conv_buf, lw.gate_up_bf16, ws.gate_up_buf, total_T, DFlash2Config::INTERMEDIATE_SIZE * 2, DFlash2Config::HIDDEN_SIZE, stream, false);
         }
         launch_silu_mul(ws.gate_up_buf, ws.mlp_mid, total_T, DFlash2Config::INTERMEDIATE_SIZE, stream);
         if (weights.use_fp8) {
-            launch_fp8_linear(target.ctx.cublas, ws.mlp_mid, lw.down_fp8, ws.conv_buf, target.ws.d_splitk_scratch, target.ws.d_bf16_w_scratch, total_T, stream);
+            launch_quant_linear(target.ctx.cublas, ws.mlp_mid, lw.down_fp8, ws.conv_buf, target.ws.d_splitk_scratch, target.ws.d_bf16_w_scratch, total_T, stream);
         } else {
             launch_bf16_linear(target.ctx.cublas, ws.mlp_mid, lw.down_bf16, ws.conv_buf, total_T, DFlash2Config::HIDDEN_SIZE, DFlash2Config::INTERMEDIATE_SIZE, stream, false);
         }
@@ -230,7 +230,7 @@ void DFlash2Model::propose_candidates(
 
     // 6) Unary logits via shared target lm_head (use FP8 lm_head if enabled -> 2x faster, 100% lossless for target!)
     if (target.weights.has_fp8_lm_head) {
-        launch_fp8_linear(
+        launch_quant_linear(
             target.ctx.cublas, ws.pred_hidden, target.weights.lm_head_fp8, ws.cand_logits,
             target.ws.d_splitk_scratch, target.ws.d_bf16_w_scratch, pred_T, stream);
     } else {

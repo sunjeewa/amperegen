@@ -9,7 +9,7 @@ User=amperegen
 Group=amperegen
 WorkingDirectory=/opt/amperegen
 
-# Optional: set persistence mode and power cap (e.g. 210 W on CMP 170HX)
+# Optional: set persistence mode and power cap
 # ExecStartPre=+/usr/bin/nvidia-smi -pm 1
 # ExecStartPre=+/usr/bin/nvidia-smi -pl 210
 
@@ -23,9 +23,7 @@ ExecStart=/opt/amperegen/build/amperegen \
   --max-running-requests 16 \
   --chunked-prefill-size 8192 \
   --block-size 8 \
-  --kv-pool-gb 18 \
-  --python /opt/amperegen/.venv/bin/python \
-  --sidecar-script /opt/amperegen/sidecar/app.py
+  --kv-pool-gb 18
 
 Restart=on-failure
 RestartSec=10

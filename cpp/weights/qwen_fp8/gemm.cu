@@ -1,8 +1,11 @@
-#include "kernels/kernels.cuh"
+#include "weights/weight_backend.hpp"
 #include "runtime/cuda_utils.cuh"
 #include <cmath>
 
 namespace amperegen {
+namespace qwen_fp8 {
+
+namespace {
 
 // ============================================================================
 // FP8 E4M3 -> BF16x2 fast bit-unpack (exact value = true_fp8 * 2^-120)
@@ -52,15 +55,8 @@ __global__ void pack_fp8_mma_kernel(
     W_packed[((size_t)n_tile * (K / 32) + k_tile) * 32 + lane] = out;
 }
 
-void launch_pack_fp8_mma(
-    const uint8_t* d_w_row, uint4* d_w_packed, int N, int K, cudaStream_t stream
-) {
-    dim3 grid(K / 32, N / 16);
-    pack_fp8_mma_kernel<<<grid, 32, 0, stream>>>(d_w_row, d_w_packed, N, K);
-}
-
 // ============================================================================
-// Quantize BF16 [N, K] -> block-128x128 FP8 packed directly into warp-MMA layout!
+// Quantize BF16 [N, K] -> block-128x128 FP8 packed directly into warp-MMA layout
 // ============================================================================
 __global__ void quantize_bf16_to_fp8_mma_kernel(
     const __nv_bfloat16* __restrict__ W_bf16,
@@ -136,19 +132,6 @@ __global__ void quantize_bf16_to_fp8_mma_kernel(
     }
 }
 
-void launch_quantize_bf16_to_fp8_mma(
-    const __nv_bfloat16* d_w_bf16,
-    uint4* d_w_packed,
-    float* d_scales_raw,
-    float* d_scales_fused,
-    int N, int K,
-    cudaStream_t stream
-) {
-    dim3 grid(K / 128, N / 128);
-    quantize_bf16_to_fp8_mma_kernel<<<grid, 256, 0, stream>>>(
-        d_w_bf16, d_w_packed, d_scales_raw, d_scales_fused, N, K);
-}
-
 // ============================================================================
 // Prepare FP8 scales (BF16 -> FP32 raw + FP32 scale*2^120)
 // ============================================================================
@@ -165,22 +148,8 @@ __global__ void prepare_fp8_scales_kernel(
     out_fused[i] = s * ldexpf(1.0f, 120);
 }
 
-void launch_prepare_fp8_scales(
-    const __nv_bfloat16* d_scales_bf16,
-    float* d_scales_raw,
-    float* d_scales_fused,
-    int num_scales,
-    cudaStream_t stream
-) {
-    prepare_fp8_scales_kernel<<<(num_scales + 255) / 256, 256, 0, stream>>>(
-        d_scales_bf16, d_scales_raw, d_scales_fused, num_scales);
-}
-
 // ============================================================================
 // Fast unpack + block-128 dequant from warp-MMA layout -> row-major BF16 [N, K]
-// Stages a full [16, 128] tile (4 KB smem, 1 scale block along K) so global writes
-// are 100% 256-byte coalesced uint4 bursts (~1,550 GB/s on GA100)!
-// Grid: (K / 128, N / 16), Block: 128 threads (4 warps = 4 contiguous k_tiles)
 // ============================================================================
 __global__ void unpack_dequant_fp8_mma_to_bf16_kernel(
     const uint4* __restrict__ W_packed,
@@ -188,10 +157,10 @@ __global__ void unpack_dequant_fp8_mma_to_bf16_kernel(
     __nv_bfloat16* __restrict__ W_bf16,
     int N, int K
 ) {
-    int kb = blockIdx.x;      // 0 .. K/128 - 1
-    int n_tile = blockIdx.y;  // 0 .. N/16 - 1
-    int tid = threadIdx.x;    // 0 .. 127
-    int wid = tid >> 5;       // 0 .. 3 -> k_tile = kb*4 + wid
+    int kb = blockIdx.x;
+    int n_tile = blockIdx.y;
+    int tid = threadIdx.x;
+    int wid = tid >> 5;
     int lane = tid & 31;
 
     int k_tiles_per_row = K >> 5;
@@ -203,7 +172,7 @@ __global__ void unpack_dequant_fp8_mma_to_bf16_kernel(
 
     uint4 w = __ldcg(W_packed + ((size_t)n_tile * k_tiles_per_row + k_tile) * 32 + lane);
 
-    __shared__ __nv_bfloat16 sTile[16][128]; // 4 KB
+    __shared__ __nv_bfloat16 sTile[16][128];
 
     int g = lane >> 2;
     int t = lane & 3;
@@ -223,14 +192,13 @@ __global__ void unpack_dequant_fp8_mma_to_bf16_kernel(
     write_smem(w.w, k_local + 24);
     __syncthreads();
 
-    // 100% coalesced 256-byte row bursts: 16 rows x 16 uint4s = 256 uint4s -> 2 uint4 stores per thread!
     int n0 = n_tile * 16;
     int k0 = kb * 128;
     #pragma unroll
     for (int pass = 0; pass < 2; ++pass) {
         int idx = pass * 128 + tid;
-        int r = idx >> 4;        // 0..15
-        int c8 = (idx & 15) << 3;// 0, 8, ..., 120
+        int r = idx >> 4;
+        int c8 = (idx & 15) << 3;
         *reinterpret_cast<uint4*>(&W_bf16[(size_t)(n0 + r) * K + (k0 + c8)]) =
             *reinterpret_cast<const uint4*>(&sTile[r][c8]);
     }
@@ -300,7 +268,6 @@ fp8_block_tc_gemm_v3_kernel(
             asm volatile("cp.async.commit_group;\n");
         };
 
-        // 3-stage pipeline prologue: load kb_start into stage 0 and (if present) kb_start+1 into stage 1
         load_sX_stage(kb_start, 0);
         if (kb_start + 1 < kb_end) {
             load_sX_stage(kb_start + 1, 1);
@@ -312,7 +279,6 @@ fp8_block_tc_gemm_v3_kernel(
 
         int s_cur = 0;
         for (int kb = kb_start; kb < kb_end; ++kb) {
-            // Stage (s_cur + 2) % 3 was last read before the preceding __syncthreads(), so it is 100% free!
             if (kb + 2 < kb_end) {
                 int s_ld = (s_cur == 0) ? 2 : (s_cur - 1);
                 load_sX_stage(kb + 2, s_ld);
@@ -324,7 +290,6 @@ fp8_block_tc_gemm_v3_kernel(
             const uint4* w0_kb = w0_base + (size_t)(kb << 2) * 32;
             const uint4* w1_kb = w1_base + (size_t)(kb << 2) * 32;
 
-            // Issue all 8 16-byte weight loads upfront for M_TILES<=2; per-kt for M_TILES==4 to keep regs low!
             if constexpr (M_TILES <= 2) {
                 uint4 wa_arr[4], wb_arr[4];
                 #pragma unroll
@@ -559,36 +524,43 @@ __global__ void splitk_reduce_to_bf16_kernel(
     reinterpret_cast<uint2*>(Y)[i] = out;
 }
 
-void launch_bf16_linear(
-    cublasHandle_t cublas,
-    const __nv_bfloat16* X,
-    const __nv_bfloat16* W,
-    __nv_bfloat16* Y,
-    int M, int N, int K,
-    cudaStream_t stream,
-    bool accumulate
+} // namespace
+
+void launch_pack_fp8_mma(
+    const uint8_t* d_w_row, uint4* d_w_packed, int N, int K, cudaStream_t stream
 ) {
-    if (M == 0) return;
-    CUBLAS_CHECK(cublasSetStream(cublas, stream));
-    float alpha = 1.0f;
-    float beta = accumulate ? 1.0f : 0.0f;
-    CUBLAS_CHECK(cublasGemmEx(
-        cublas,
-        CUBLAS_OP_T, CUBLAS_OP_N,
-        N, M, K,
-        &alpha,
-        W, CUDA_R_16BF, K,
-        X, CUDA_R_16BF, K,
-        &beta,
-        Y, CUDA_R_16BF, N,
-        CUBLAS_COMPUTE_32F,
-        CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+    dim3 grid(K / 32, N / 16);
+    pack_fp8_mma_kernel<<<grid, 32, 0, stream>>>(d_w_row, d_w_packed, N, K);
+}
+
+void launch_quantize_bf16_to_fp8_mma(
+    const __nv_bfloat16* d_w_bf16,
+    uint4* d_w_packed,
+    float* d_scales_raw,
+    float* d_scales_fused,
+    int N, int K,
+    cudaStream_t stream
+) {
+    dim3 grid(K / 128, N / 128);
+    quantize_bf16_to_fp8_mma_kernel<<<grid, 256, 0, stream>>>(
+        d_w_bf16, d_w_packed, d_scales_raw, d_scales_fused, N, K);
+}
+
+void launch_prepare_fp8_scales(
+    const __nv_bfloat16* d_scales_bf16,
+    float* d_scales_raw,
+    float* d_scales_fused,
+    int num_scales,
+    cudaStream_t stream
+) {
+    prepare_fp8_scales_kernel<<<(num_scales + 255) / 256, 256, 0, stream>>>(
+        d_scales_bf16, d_scales_raw, d_scales_fused, num_scales);
 }
 
 void launch_fp8_linear(
     cublasHandle_t cublas,
     const __nv_bfloat16* X,
-    const Fp8LinearWeight& W,
+    const QuantLinearWeight& W,
     __nv_bfloat16* Y,
     float* d_splitk_scratch,
     __nv_bfloat16* d_bf16_scratch,
@@ -598,26 +570,24 @@ void launch_fp8_linear(
     if (M == 0) return;
     int N = W.N;
     int K = W.K;
+    const uint4* w_packed = static_cast<const uint4*>(W.w_packed);
+    const float* scales_fused = static_cast<const float*>(W.scales);
 
-    // For M <= 64 (or lm_head N > 65536): K1 v3 3-stage cp.async 2x N-tile Tensor Core kernel!
-    // Handles M=1..8 (M_TILES=1), M=9..16 (M_TILES=2), and M=17..32 (M_TILES=4, single FP8 weight read!)
-    // For M > 64 (prefill & very large batches): fast unpack to BF16 scratch + cuBLAS (~188 TFLOPS!).
     if (M <= 64 || N > 65536) {
-        // Exact tuned (wn, sk) table from k1_v3_tune on CMP 170HX (70 SMs):
         int wn = 4;
         int sk = 4;
         if (N >= 100000) {
             wn = (M <= 6) ? 2 : 4;
-            sk = 1; // lm_head: 1,470-1,565 GB/s!
+            sk = 1;
         } else if (N >= 32768) {
             wn = 4;
-            sk = (M <= 1) ? 4 : 1; // gate_up: 272 blocks (3.9 waves) at sk=1 -> ZERO splitk_reduce!
+            sk = (M <= 1) ? 4 : 1;
         } else if (N >= 14000) {
             wn = 4;
-            sk = (M <= 1 && N >= 16384) ? 8 : ((M <= 16) ? 4 : 2); // qkv_full & qkvz_gdn
+            sk = (M <= 1 && N >= 16384) ? 8 : ((M <= 16) ? 4 : 2);
         } else {
             wn = (M <= 8 && K >= 16384) ? 2 : 4;
-            sk = (M <= 16) ? 8 : 4; // o_proj & down_proj
+            sk = (M <= 16) ? 8 : 4;
         }
         int max_sk = K / 128;
         if (sk > max_sk) sk = max_sk;
@@ -633,15 +603,14 @@ void launch_fp8_linear(
             dim3 grid(blocks_n, sk);
             int th = wn * 32;
             if (mc <= 8) {
-                if (wn == 2) fp8_block_tc_gemm_v3_kernel<2, 1><<<grid, th, 0, stream>>>(Xc, W.w_packed, W.scales_fused, Yc, d_splitk_scratch, mc, N, K, sk);
-                else         fp8_block_tc_gemm_v3_kernel<4, 1><<<grid, th, 0, stream>>>(Xc, W.w_packed, W.scales_fused, Yc, d_splitk_scratch, mc, N, K, sk);
+                if (wn == 2) fp8_block_tc_gemm_v3_kernel<2, 1><<<grid, th, 0, stream>>>(Xc, w_packed, scales_fused, Yc, d_splitk_scratch, mc, N, K, sk);
+                else         fp8_block_tc_gemm_v3_kernel<4, 1><<<grid, th, 0, stream>>>(Xc, w_packed, scales_fused, Yc, d_splitk_scratch, mc, N, K, sk);
             } else if (mc <= 16) {
-                if (wn == 2) fp8_block_tc_gemm_v3_kernel<2, 2><<<grid, th, 0, stream>>>(Xc, W.w_packed, W.scales_fused, Yc, d_splitk_scratch, mc, N, K, sk);
-                else         fp8_block_tc_gemm_v3_kernel<4, 2><<<grid, th, 0, stream>>>(Xc, W.w_packed, W.scales_fused, Yc, d_splitk_scratch, mc, N, K, sk);
+                if (wn == 2) fp8_block_tc_gemm_v3_kernel<2, 2><<<grid, th, 0, stream>>>(Xc, w_packed, scales_fused, Yc, d_splitk_scratch, mc, N, K, sk);
+                else         fp8_block_tc_gemm_v3_kernel<4, 2><<<grid, th, 0, stream>>>(Xc, w_packed, scales_fused, Yc, d_splitk_scratch, mc, N, K, sk);
             } else {
-                // M_TILES=4 (mc in 17..32): 1 single FP8 weight read for B=3..4 with block_size=8!
-                if (wn == 2) fp8_block_tc_gemm_v3_kernel<2, 4><<<grid, th, 0, stream>>>(Xc, W.w_packed, W.scales_fused, Yc, d_splitk_scratch, mc, N, K, sk);
-                else         fp8_block_tc_gemm_v3_kernel<4, 4><<<grid, th, 0, stream>>>(Xc, W.w_packed, W.scales_fused, Yc, d_splitk_scratch, mc, N, K, sk);
+                if (wn == 2) fp8_block_tc_gemm_v3_kernel<2, 4><<<grid, th, 0, stream>>>(Xc, w_packed, scales_fused, Yc, d_splitk_scratch, mc, N, K, sk);
+                else         fp8_block_tc_gemm_v3_kernel<4, 4><<<grid, th, 0, stream>>>(Xc, w_packed, scales_fused, Yc, d_splitk_scratch, mc, N, K, sk);
             }
             if (sk > 1) {
                 size_t mn4 = ((size_t)mc * N) >> 2;
@@ -652,9 +621,10 @@ void launch_fp8_linear(
     } else {
         dim3 grid(K / 128, N / 16);
         unpack_dequant_fp8_mma_to_bf16_kernel<<<grid, 128, 0, stream>>>(
-            W.w_packed, W.scales_fused, d_bf16_scratch, N, K);
+            w_packed, scales_fused, d_bf16_scratch, N, K);
         launch_bf16_linear(cublas, X, d_bf16_scratch, Y, M, N, K, stream, false);
     }
 }
 
+} // namespace qwen_fp8
 } // namespace amperegen

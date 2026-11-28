@@ -1,6 +1,6 @@
 #pragma once
 #include "scheduler/scheduler.hpp"
-#include "server/sidecar_client.hpp"
+#include "server/tokenizer.hpp"
 #include <atomic>
 #include <string>
 
@@ -8,7 +8,7 @@ namespace amperegen {
 
 class HttpServer {
 public:
-    HttpServer(Scheduler& sched, SidecarClient& sidecar, const std::string& host, int port);
+    HttpServer(Scheduler& sched, const NativeTokenizer& tok, const std::string& host, int port);
     ~HttpServer();
 
     void serve(); // blocking accept loop until stop()
@@ -16,7 +16,7 @@ public:
 
 private:
     Scheduler& sched_;
-    SidecarClient& sidecar_;
+    const NativeTokenizer& tok_;
     std::string host_;
     int port_;
     int listen_fd_ = -1;

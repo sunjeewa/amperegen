@@ -44,7 +44,9 @@ void Scheduler::init(const EngineConfig& config) {
     cfg = config;
     target.init_context();
 
-    load_target_weights(cfg.model_dir, target.weights, cfg.enable_dflash && cfg.fp8_lm_draft, target.ctx.stream);
+    load_target_weights(
+        cfg.model_dir, target.weights, cfg.enable_dflash && cfg.fp8_lm_draft,
+        target.ctx.stream, cfg.weight_backend);
 
     int active_slots = cfg.max_running_requests + 2;
     if (cfg.prefix_cache_slots < 0) cfg.prefix_cache_slots = 0;

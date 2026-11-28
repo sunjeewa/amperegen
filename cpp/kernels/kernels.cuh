@@ -4,68 +4,9 @@
 #include <cuda_fp8.h>
 #include <cublas_v2.h>
 #include <cstdint>
+#include "weights/weight_backend.hpp"
 
 namespace amperegen {
-
-// ============================================================================
-// K1: FP8 Block-128x128 Weight-Only Dequant GEMM / GEMV (sm_80 Tensor Cores)
-// ============================================================================
-struct Fp8LinearWeight {
-    uint4* w_packed = nullptr;      // [N/16, K/32, 32] warp-MMA packed FP8 (for M <= 32 fast TC path)
-    uint8_t* w_row = nullptr;       // Optional row-major FP8 (nullptr to save VRAM — we unpack directly from w_packed!)
-    float* scales_raw = nullptr;    // [N/128, K/128] FP32 raw scale_inv (for prefill dequant)
-    float* scales_fused = nullptr;  // [N/128, K/128] FP32 scale_inv * 2^120 (for decode TC)
-    int N = 0;
-    int K = 0;
-};
-
-// Pack row-major FP8 [N, K] into warp-MMA layout [N/16, K/32, 32] on GPU.
-void launch_pack_fp8_mma(
-    const uint8_t* d_w_row,
-    uint4* d_w_packed,
-    int N, int K,
-    cudaStream_t stream);
-
-// Convert BF16 weight [N, K] on GPU into FP8 block-128x128 packed + scales (used for lossless DFlash2 draft compression!)
-void launch_quantize_bf16_to_fp8_mma(
-    const __nv_bfloat16* d_w_bf16,
-    uint4* d_w_packed,
-    float* d_scales_raw,
-    float* d_scales_fused,
-    int N, int K,
-    cudaStream_t stream);
-
-// Convert BF16 scale_inv [N/128, K/128] into FP32 raw & fused (scale * 2^120)
-void launch_prepare_fp8_scales(
-    const __nv_bfloat16* d_scales_bf16,
-    float* d_scales_raw,
-    float* d_scales_fused,
-    int num_scales,
-    cudaStream_t stream);
-
-// Execute Y[M, N] = X[M, K] * W[N, K]^T
-// Automatically dispatches:
-//   - M <= 32: custom fused FP8-dequant m16n8k16 Tensor Core GEMM (zero BF16 weight materialization!)
-//   - M > 32:  fast unpack+dequant from w_packed -> d_bf16_scratch [N, K] + cuBLAS BF16 Tensor Core GEMM!
-void launch_fp8_linear(
-    cublasHandle_t cublas,
-    const __nv_bfloat16* X,
-    const Fp8LinearWeight& W,
-    __nv_bfloat16* Y,
-    float* d_splitk_scratch,        // >= 32 * maxN * sizeof(float)
-    __nv_bfloat16* d_bf16_scratch,  // >= max(N*K) * sizeof(bf16) (~356 MB for gate_up) for prefill M > 32
-    int M,
-    cudaStream_t stream);
-
-// Dense BF16 linear via cuBLAS: Y[M, N] = X[M, K] * W[N, K]^T (row-major)
-void launch_bf16_linear(
-    cublasHandle_t cublas,
-    const __nv_bfloat16* X,
-    const __nv_bfloat16* W,
-    __nv_bfloat16* Y,
-    int M, int N, int K,
-    cudaStream_t stream,
-    bool accumulate = false);
 
 // ============================================================================
 // K2 / K3 / K9 / K11: Norms, RoPE, Activations, Embeddings

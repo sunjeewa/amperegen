@@ -70,12 +70,12 @@ void compare_bf16(const char* name, const std::vector<__nv_bfloat16>& a, const s
 // Stage-1: Verify Layer 0 (GDN chunked prefill + step-by-step decode) & Layer 3 (Full-Attn prefill + decode)
 // against pure-PyTorch reference in ref/stage1/!
 // ============================================================================
-void run_stage1(const std::string& model_dir, const std::string& ref_dir) {
+void run_stage1(const std::string& model_dir, const std::string& ref_dir, const std::string& weight_backend) {
     printf("=== STAGE-1: PER-LAYER NUMERICAL VERIFICATION (vs pure-PyTorch ref) ===\n");
     Qwen35Model model;
     model.init_context();
-    load_single_target_layer(model_dir, 0, model.weights, model.ctx.stream);
-    load_single_target_layer(model_dir, 3, model.weights, model.ctx.stream);
+    load_single_target_layer(model_dir, 0, model.weights, model.ctx.stream, weight_backend);
+    load_single_target_layer(model_dir, 3, model.weights, model.ctx.stream, weight_backend);
     model.init_workspace_and_pools(256, 2, 1, 8, 64ULL * 1024 * 1024);
 
     auto x_in = read_bf16_file(ref_dir + "/x_in.bf16");
@@ -131,16 +131,16 @@ void run_stage1(const std::string& model_dir, const std::string& ref_dir) {
         CUDA_CHECK(cudaMemcpy(model.ws.residual, x_in.data() + (size_t)t * 5120, 5120 * 2, cudaMemcpyHostToDevice));
         const auto& lw = model.weights.gdn[0];
         launch_rmsnorm(model.ws.residual, lw.input_layernorm, model.ws.norm_out, 1, 5120, 1e-6f, true, model.ctx.stream);
-        launch_fp8_linear(model.ctx.cublas, model.ws.norm_out, lw.in_proj_qkvz, model.ws.qkv_buf, model.ws.d_splitk_scratch, model.ws.d_bf16_w_scratch, 1, model.ctx.stream);
+        launch_quant_linear(model.ctx.cublas, model.ws.norm_out, lw.in_proj_qkvz, model.ws.qkv_buf, model.ws.d_splitk_scratch, model.ws.d_bf16_w_scratch, 1, model.ctx.stream);
         launch_bf16_linear(model.ctx.cublas, model.ws.norm_out, lw.in_proj_ba, model.ws.ba_buf, 1, 96, 5120, model.ctx.stream, false);
         launch_gdn_conv1d_decode_verify(model.ws.qkv_buf, lw.conv1d_w, model.pools.conv_states[0], nullptr, d_sslots, model.ws.conv_out, 1, 1, true, model.ctx.stream);
         launch_gdn_recurrent_decode_verify(model.ws.conv_out, model.ws.ba_buf, lw.A_log, lw.dt_bias, model.pools.ssm_states[0], nullptr, d_sslots, model.ws.q_buf, 1, 1, true, model.ctx.stream);
         launch_gdn_rmsnorm_gated(model.ws.q_buf, model.ws.qkv_buf, lw.gdn_norm, model.ws.attn_out, 1, 1e-6f, model.ctx.stream);
-        launch_fp8_linear(model.ctx.cublas, model.ws.attn_out, lw.out_proj, model.ws.sub_out, model.ws.d_splitk_scratch, model.ws.d_bf16_w_scratch, 1, model.ctx.stream);
+        launch_quant_linear(model.ctx.cublas, model.ws.attn_out, lw.out_proj, model.ws.sub_out, model.ws.d_splitk_scratch, model.ws.d_bf16_w_scratch, 1, model.ctx.stream);
         launch_fused_add_rmsnorm(model.ws.sub_out, model.ws.residual, lw.post_attention_layernorm, model.ws.norm_out, 1, 5120, 1e-6f, true, model.ctx.stream);
-        launch_fp8_linear(model.ctx.cublas, model.ws.norm_out, lw.gate_up_proj, model.ws.gate_up_buf, model.ws.d_splitk_scratch, model.ws.d_bf16_w_scratch, 1, model.ctx.stream);
+        launch_quant_linear(model.ctx.cublas, model.ws.norm_out, lw.gate_up_proj, model.ws.gate_up_buf, model.ws.d_splitk_scratch, model.ws.d_bf16_w_scratch, 1, model.ctx.stream);
         launch_silu_mul(model.ws.gate_up_buf, model.ws.mlp_mid, 1, 17408, model.ctx.stream);
-        launch_fp8_linear(model.ctx.cublas, model.ws.mlp_mid, lw.down_proj, model.ws.sub_out, model.ws.d_splitk_scratch, model.ws.d_bf16_w_scratch, 1, model.ctx.stream);
+        launch_quant_linear(model.ctx.cublas, model.ws.mlp_mid, lw.down_proj, model.ws.sub_out, model.ws.d_splitk_scratch, model.ws.d_bf16_w_scratch, 1, model.ctx.stream);
         CUDA_CHECK(cudaStreamSynchronize(model.ctx.stream));
         std::vector<__nv_bfloat16> r(5120), s(5120);
         CUDA_CHECK(cudaMemcpy(r.data(), model.ws.residual, 5120 * 2, cudaMemcpyDeviceToHost));
@@ -163,7 +163,7 @@ void run_stage1(const std::string& model_dir, const std::string& ref_dir) {
     CUDA_CHECK(cudaMemcpy(model.ws.residual, l0_ref.data() + (size_t)(T - q_len) * 5120, (size_t)q_len * 5120 * 2, cudaMemcpyHostToDevice));
     const auto& l3w = model.weights.full_attn[0];
     launch_rmsnorm(model.ws.residual, l3w.input_layernorm, model.ws.norm_out, q_len, 5120, 1e-6f, true, model.ctx.stream);
-    launch_fp8_linear(model.ctx.cublas, model.ws.norm_out, l3w.qkv_proj, model.ws.qkv_buf, model.ws.d_splitk_scratch, model.ws.d_bf16_w_scratch, q_len, model.ctx.stream);
+    launch_quant_linear(model.ctx.cublas, model.ws.norm_out, l3w.qkv_proj, model.ws.qkv_buf, model.ws.d_splitk_scratch, model.ws.d_bf16_w_scratch, q_len, model.ctx.stream);
     launch_full_attn_qkv_prep_and_kv_write(
         model.ws.qkv_buf, l3w.q_norm, l3w.k_norm, model.ws.rope_cos, model.ws.rope_sin, d_pos + (T - q_len),
         model.ws.q_buf, model.ws.gate_buf, model.pools.k_cache[0], model.pools.v_cache[0], d_slots + (T - q_len),
@@ -172,11 +172,11 @@ void run_stage1(const std::string& model_dir, const std::string& ref_dir) {
         model.ws.q_buf, model.ws.gate_buf, model.pools.k_cache[0], model.pools.v_cache[0],
         d_bt, d_kvlen, model.ws.attn_out, model.ws.fa_splitk_out, model.ws.fa_splitk_lse,
         1, q_len, 16, T, model.ctx.stream);
-    launch_fp8_linear(model.ctx.cublas, model.ws.attn_out, l3w.o_proj, model.ws.sub_out, model.ws.d_splitk_scratch, model.ws.d_bf16_w_scratch, q_len, model.ctx.stream);
+    launch_quant_linear(model.ctx.cublas, model.ws.attn_out, l3w.o_proj, model.ws.sub_out, model.ws.d_splitk_scratch, model.ws.d_bf16_w_scratch, q_len, model.ctx.stream);
     launch_fused_add_rmsnorm(model.ws.sub_out, model.ws.residual, l3w.post_attention_layernorm, model.ws.norm_out, q_len, 5120, 1e-6f, true, model.ctx.stream);
-    launch_fp8_linear(model.ctx.cublas, model.ws.norm_out, l3w.gate_up_proj, model.ws.gate_up_buf, model.ws.d_splitk_scratch, model.ws.d_bf16_w_scratch, q_len, model.ctx.stream);
+    launch_quant_linear(model.ctx.cublas, model.ws.norm_out, l3w.gate_up_proj, model.ws.gate_up_buf, model.ws.d_splitk_scratch, model.ws.d_bf16_w_scratch, q_len, model.ctx.stream);
     launch_silu_mul(model.ws.gate_up_buf, model.ws.mlp_mid, q_len, 17408, model.ctx.stream);
-    launch_fp8_linear(model.ctx.cublas, model.ws.mlp_mid, l3w.down_proj, model.ws.sub_out, model.ws.d_splitk_scratch, model.ws.d_bf16_w_scratch, q_len, model.ctx.stream);
+    launch_quant_linear(model.ctx.cublas, model.ws.mlp_mid, l3w.down_proj, model.ws.sub_out, model.ws.d_splitk_scratch, model.ws.d_bf16_w_scratch, q_len, model.ctx.stream);
     CUDA_CHECK(cudaStreamSynchronize(model.ctx.stream));
     std::vector<__nv_bfloat16> r6(q_len * 5120), s6(q_len * 5120), l3_dec_got(q_len * 5120), l3_tail(q_len * 5120);
     CUDA_CHECK(cudaMemcpy(r6.data(), model.ws.residual, r6.size() * 2, cudaMemcpyDeviceToHost));
@@ -204,17 +204,19 @@ void run_full_bench(
     bool fp8_lm_head_for_draft,
     int block_size,
     bool use_cuda_graph,
-    const std::string& out_ids_path
+    const std::string& out_ids_path,
+    const std::string& weight_backend
 ) {
     auto prompt_ids = read_i32_file(prompt_ids_path);
     int prompt_len = (int)prompt_ids.size();
     printf("=== FULL MODEL BENCHMARK ===\n");
-    printf("prompt_len=%d max_new=%d dflash=%d draft_fp8=%d fp8_lm_draft=%d block_size=%d graph=%d\n",
-           prompt_len, max_new_tokens, (int)use_dflash, (int)draft_fp8, (int)fp8_lm_head_for_draft, block_size, (int)use_cuda_graph);
+    printf("prompt_len=%d max_new=%d dflash=%d draft_fp8=%d fp8_lm_draft=%d block_size=%d graph=%d backend=%s\n",
+           prompt_len, max_new_tokens, (int)use_dflash, (int)draft_fp8, (int)fp8_lm_head_for_draft,
+           block_size, (int)use_cuda_graph, weight_backend.c_str());
 
     Qwen35Model model;
     model.init_context();
-    load_target_weights(model_dir, model.weights, use_dflash && fp8_lm_head_for_draft, model.ctx.stream);
+    load_target_weights(model_dir, model.weights, use_dflash && fp8_lm_head_for_draft, model.ctx.stream, weight_backend);
 
     // Reserve KV pool comfortably inside 64GB
     int max_ctx = std::max(prompt_len + max_new_tokens + 64, 65536);
@@ -488,14 +490,15 @@ void run_suite(
     const std::string& draft_dir,
     const std::string& prompt_dir,
     bool draft_fp8,
-    bool fp8_lm_draft
+    bool fp8_lm_draft,
+    const std::string& weight_backend
 ) {
-    printf("=== FULL SUITE BENCHMARK (single weight load, draft_fp8=%d, fp8_lm_draft=%d) ===\n",
-           (int)draft_fp8, (int)fp8_lm_draft);
+    printf("=== FULL SUITE BENCHMARK (single weight load, draft_fp8=%d, fp8_lm_draft=%d, backend=%s) ===\n",
+           (int)draft_fp8, (int)fp8_lm_draft, weight_backend.c_str());
 
     Qwen35Model model;
     model.init_context();
-    load_target_weights(model_dir, model.weights, fp8_lm_draft, model.ctx.stream);
+    load_target_weights(model_dir, model.weights, fp8_lm_draft, model.ctx.stream, weight_backend);
 
     int max_ctx = 65536;
     int max_blocks = (max_ctx + 15) / 16 + 32;
@@ -808,6 +811,39 @@ void run_suite(
     model.destroy();
 }
 
+int run_weight_self_tests(const std::string& requested_backend) {
+    printf("=== CURATED WEIGHT PLUGIN SELF-TESTS (compiled: %s) ===\n",
+           WeightRegistry::compiled_ids_string().c_str());
+    CudaContext ctx;
+    ctx.init();
+    bool all_ok = true;
+    int ran = 0;
+
+    if (requested_backend.empty() || requested_backend == "auto") {
+        for (const auto* b : WeightRegistry::all()) {
+            printf("--- Testing plugin '%s': %s ---\n", b->id(), b->description());
+            bool ok = b->self_test(ctx.cublas, ctx.stream);
+            if (!ok) all_ok = false;
+            ++ran;
+        }
+    } else {
+        const auto* b = WeightRegistry::find(requested_backend);
+        if (!b) {
+            fprintf(stderr, "FATAL: weight backend '%s' is not compiled in (available: %s)\n",
+                    requested_backend.c_str(), WeightRegistry::compiled_ids_string().c_str());
+            ctx.destroy();
+            return 1;
+        }
+        printf("--- Testing plugin '%s': %s ---\n", b->id(), b->description());
+        all_ok = b->self_test(ctx.cublas, ctx.stream);
+        ran = 1;
+    }
+
+    ctx.destroy();
+    printf("=== WEIGHT SELF-TESTS: %d plugin(s) ran -> %s ===\n", ran, (all_ok && ran > 0) ? "ALL PASS" : "FAILED");
+    return (all_ok && ran > 0) ? 0 : 1;
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
@@ -818,6 +854,7 @@ int main(int argc, char** argv) {
     std::string prompt_ids = "ref/stage1/tok_ids.bin";
     std::string prompt_dir = "ref/prompts";
     std::string out_ids;
+    std::string weight_backend = "auto";
     int max_new = 256;
     int block_size = 8;
     bool use_dflash = false;
@@ -831,8 +868,11 @@ int main(int argc, char** argv) {
         else if (a == "--stage2") { mode = "full"; use_dflash = false; }
         else if (a == "--stage3") { mode = "full"; use_dflash = true; }
         else if (a == "--suite") mode = "suite";
+        else if (a == "--test-weights") mode = "test_weights";
+        else if (a == "--probe-weights") mode = "probe_weights";
         else if (a == "--model-dir" && i + 1 < argc) model_dir = argv[++i];
         else if (a == "--draft-dir" && i + 1 < argc) draft_dir = argv[++i];
+        else if (a == "--weight-backend" && i + 1 < argc) weight_backend = argv[++i];
         else if (a == "--ref-dir" && i + 1 < argc) ref_dir = argv[++i];
         else if (a == "--prompt-ids" && i + 1 < argc) prompt_ids = argv[++i];
         else if (a == "--prompt-dir" && i + 1 < argc) prompt_dir = argv[++i];
@@ -845,12 +885,18 @@ int main(int argc, char** argv) {
     }
 
     try {
-        if (mode == "stage1") {
-            run_stage1(model_dir, ref_dir);
+        if (mode == "test_weights") {
+            return run_weight_self_tests(weight_backend);
+        } else if (mode == "probe_weights") {
+            const WeightBackend* b = WeightRegistry::resolve(model_dir, weight_backend);
+            printf("[probe] QUALIFIED: %s -> %s (%s)\n", model_dir.c_str(), b->id(), b->description());
+            return 0;
+        } else if (mode == "stage1") {
+            run_stage1(model_dir, ref_dir, weight_backend);
         } else if (mode == "suite") {
-            run_suite(model_dir, draft_dir, prompt_dir, draft_fp8, fp8_lm_draft);
+            run_suite(model_dir, draft_dir, prompt_dir, draft_fp8, fp8_lm_draft, weight_backend);
         } else {
-            run_full_bench(model_dir, draft_dir, prompt_ids, max_new, use_dflash, draft_fp8, fp8_lm_draft, block_size, use_graph, out_ids);
+            run_full_bench(model_dir, draft_dir, prompt_ids, max_new, use_dflash, draft_fp8, fp8_lm_draft, block_size, use_graph, out_ids, weight_backend);
         }
     } catch (const std::exception& e) {
         fprintf(stderr, "FATAL: %s\n", e.what());

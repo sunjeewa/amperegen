@@ -193,7 +193,7 @@ void Qwen35Model::forward_layer_prefill(
         // 1) Input GemmaRMSNorm
         launch_rmsnorm(residual, lw.input_layernorm, ws.norm_out, total_T, Qwen35Config::HIDDEN_SIZE, Qwen35Config::RMS_EPS, true, stream);
         // 2) QKV projection [total_T, 14336]
-        launch_fp8_linear(ctx.cublas, ws.norm_out, lw.qkv_proj, ws.qkv_buf, ws.d_splitk_scratch, ws.d_bf16_w_scratch, total_T, stream);
+        launch_quant_linear(ctx.cublas, ws.norm_out, lw.qkv_proj, ws.qkv_buf, ws.d_splitk_scratch, ws.d_bf16_w_scratch, total_T, stream);
         // 3) Split q/gate + QK GemmaRMSNorm + partial NeoX RoPE + FP8 KV cache write
         launch_full_attn_qkv_prep_and_kv_write(
             ws.qkv_buf, lw.q_norm, lw.k_norm, ws.rope_cos, ws.rope_sin, positions,
@@ -205,13 +205,13 @@ void Qwen35Model::forward_layer_prefill(
             block_tables, cu_seqlens, kv_lens, ws.attn_out,
             B, max_q_len, max_blocks_per_seq, stream);
         // 5) O projection
-        launch_fp8_linear(ctx.cublas, ws.attn_out, lw.o_proj, ws.sub_out, ws.d_splitk_scratch, ws.d_bf16_w_scratch, total_T, stream);
+        launch_quant_linear(ctx.cublas, ws.attn_out, lw.o_proj, ws.sub_out, ws.d_splitk_scratch, ws.d_bf16_w_scratch, total_T, stream);
         // 6) Fused residual add + post_attention GemmaRMSNorm
         launch_fused_add_rmsnorm(ws.sub_out, residual, lw.post_attention_layernorm, ws.norm_out, total_T, Qwen35Config::HIDDEN_SIZE, Qwen35Config::RMS_EPS, true, stream);
         // 7) MLP SwiGLU
-        launch_fp8_linear(ctx.cublas, ws.norm_out, lw.gate_up_proj, ws.gate_up_buf, ws.d_splitk_scratch, ws.d_bf16_w_scratch, total_T, stream);
+        launch_quant_linear(ctx.cublas, ws.norm_out, lw.gate_up_proj, ws.gate_up_buf, ws.d_splitk_scratch, ws.d_bf16_w_scratch, total_T, stream);
         launch_silu_mul(ws.gate_up_buf, ws.mlp_mid, total_T, Qwen35Config::INTERMEDIATE_SIZE, stream);
-        launch_fp8_linear(ctx.cublas, ws.mlp_mid, lw.down_proj, ws.sub_out, ws.d_splitk_scratch, ws.d_bf16_w_scratch, total_T, stream);
+        launch_quant_linear(ctx.cublas, ws.mlp_mid, lw.down_proj, ws.sub_out, ws.d_splitk_scratch, ws.d_bf16_w_scratch, total_T, stream);
         // 8) Residual add
         launch_bf16_add_inplace(residual, ws.sub_out, (size_t)total_T * Qwen35Config::HIDDEN_SIZE, stream);
     } else {
@@ -221,7 +221,7 @@ void Qwen35Model::forward_layer_prefill(
         // 1) Input GemmaRMSNorm
         launch_rmsnorm(residual, lw.input_layernorm, ws.norm_out, total_T, Qwen35Config::HIDDEN_SIZE, Qwen35Config::RMS_EPS, true, stream);
         // 2) QKVZ (FP8) + BA (BF16) projections
-        launch_fp8_linear(ctx.cublas, ws.norm_out, lw.in_proj_qkvz, ws.qkv_buf, ws.d_splitk_scratch, ws.d_bf16_w_scratch, total_T, stream);
+        launch_quant_linear(ctx.cublas, ws.norm_out, lw.in_proj_qkvz, ws.qkv_buf, ws.d_splitk_scratch, ws.d_bf16_w_scratch, total_T, stream);
         launch_bf16_linear(ctx.cublas, ws.norm_out, lw.in_proj_ba, ws.ba_buf, total_T, Qwen35Config::GDN_BA_DIM, Qwen35Config::HIDDEN_SIZE, stream, false);
         // 3) Causal depthwise Conv1d + SiLU
         launch_gdn_conv1d_prefill(
@@ -235,13 +235,13 @@ void Qwen35Model::forward_layer_prefill(
         // 5) Plain RMSNormGated (with Swish(z) read directly from ws.qkv_buf[:, 10240:])
         launch_gdn_rmsnorm_gated(ws.q_buf, ws.qkv_buf, lw.gdn_norm, ws.attn_out, total_T, Qwen35Config::RMS_EPS, stream);
         // 6) Out projection
-        launch_fp8_linear(ctx.cublas, ws.attn_out, lw.out_proj, ws.sub_out, ws.d_splitk_scratch, ws.d_bf16_w_scratch, total_T, stream);
+        launch_quant_linear(ctx.cublas, ws.attn_out, lw.out_proj, ws.sub_out, ws.d_splitk_scratch, ws.d_bf16_w_scratch, total_T, stream);
         // 7) Fused residual add + post_attention GemmaRMSNorm
         launch_fused_add_rmsnorm(ws.sub_out, residual, lw.post_attention_layernorm, ws.norm_out, total_T, Qwen35Config::HIDDEN_SIZE, Qwen35Config::RMS_EPS, true, stream);
         // 8) MLP SwiGLU
-        launch_fp8_linear(ctx.cublas, ws.norm_out, lw.gate_up_proj, ws.gate_up_buf, ws.d_splitk_scratch, ws.d_bf16_w_scratch, total_T, stream);
+        launch_quant_linear(ctx.cublas, ws.norm_out, lw.gate_up_proj, ws.gate_up_buf, ws.d_splitk_scratch, ws.d_bf16_w_scratch, total_T, stream);
         launch_silu_mul(ws.gate_up_buf, ws.mlp_mid, total_T, Qwen35Config::INTERMEDIATE_SIZE, stream);
-        launch_fp8_linear(ctx.cublas, ws.mlp_mid, lw.down_proj, ws.sub_out, ws.d_splitk_scratch, ws.d_bf16_w_scratch, total_T, stream);
+        launch_quant_linear(ctx.cublas, ws.mlp_mid, lw.down_proj, ws.sub_out, ws.d_splitk_scratch, ws.d_bf16_w_scratch, total_T, stream);
         // 9) Residual add
         launch_bf16_add_inplace(residual, ws.sub_out, (size_t)total_T * Qwen35Config::HIDDEN_SIZE, stream);
     }
@@ -329,7 +329,7 @@ void Qwen35Model::forward_decode_verify(
                 }
             }
 
-            launch_fp8_linear(ctx.cublas, ws.norm_out, lw.qkv_proj, ws.qkv_buf, ws.d_splitk_scratch, ws.d_bf16_w_scratch, total_T, stream);
+            launch_quant_linear(ctx.cublas, ws.norm_out, lw.qkv_proj, ws.qkv_buf, ws.d_splitk_scratch, ws.d_bf16_w_scratch, total_T, stream);
             launch_full_attn_qkv_prep_and_kv_write(
                 ws.qkv_buf, lw.q_norm, lw.k_norm, ws.rope_cos, ws.rope_sin, d_positions,
                 ws.q_buf, ws.gate_buf, pools.k_cache[fa], pools.v_cache[fa], d_slot_mapping,
@@ -339,11 +339,11 @@ void Qwen35Model::forward_decode_verify(
                 d_block_tables, d_seq_lens, ws.attn_out,
                 ws.fa_splitk_out, ws.fa_splitk_lse,
                 B, q_len, max_blocks_per_seq, max_seq_len_hint, stream);
-            launch_fp8_linear(ctx.cublas, ws.attn_out, lw.o_proj, ws.sub_out, ws.d_splitk_scratch, ws.d_bf16_w_scratch, total_T, stream);
+            launch_quant_linear(ctx.cublas, ws.attn_out, lw.o_proj, ws.sub_out, ws.d_splitk_scratch, ws.d_bf16_w_scratch, total_T, stream);
             launch_fused_add_rmsnorm(ws.sub_out, ws.residual, lw.post_attention_layernorm, ws.norm_out, total_T, Qwen35Config::HIDDEN_SIZE, Qwen35Config::RMS_EPS, true, stream);
-            launch_fp8_linear(ctx.cublas, ws.norm_out, lw.gate_up_proj, ws.gate_up_buf, ws.d_splitk_scratch, ws.d_bf16_w_scratch, total_T, stream);
+            launch_quant_linear(ctx.cublas, ws.norm_out, lw.gate_up_proj, ws.gate_up_buf, ws.d_splitk_scratch, ws.d_bf16_w_scratch, total_T, stream);
             launch_silu_mul(ws.gate_up_buf, ws.mlp_mid, total_T, Qwen35Config::INTERMEDIATE_SIZE, stream);
-            launch_fp8_linear(ctx.cublas, ws.mlp_mid, lw.down_proj, ws.sub_out, ws.d_splitk_scratch, ws.d_bf16_w_scratch, total_T, stream);
+            launch_quant_linear(ctx.cublas, ws.mlp_mid, lw.down_proj, ws.sub_out, ws.d_splitk_scratch, ws.d_bf16_w_scratch, total_T, stream);
         } else {
             int gi = Qwen35Config::gdn_idx(L);
             const auto& lw = weights.gdn[gi];
@@ -362,7 +362,7 @@ void Qwen35Model::forward_decode_verify(
             __nv_bfloat16* ba_dst = commit_gdn_inplace ? ws.ba_buf : pools.ba_verify[gi];
             __nv_bfloat16* conv_inter_dst = commit_gdn_inplace ? nullptr : pools.conv_inter[gi];
 
-            launch_fp8_linear(ctx.cublas, ws.norm_out, lw.in_proj_qkvz, ws.qkv_buf, ws.d_splitk_scratch, ws.d_bf16_w_scratch, total_T, stream);
+            launch_quant_linear(ctx.cublas, ws.norm_out, lw.in_proj_qkvz, ws.qkv_buf, ws.d_splitk_scratch, ws.d_bf16_w_scratch, total_T, stream);
             launch_bf16_linear(ctx.cublas, ws.norm_out, lw.in_proj_ba, ba_dst, total_T, Qwen35Config::GDN_BA_DIM, Qwen35Config::HIDDEN_SIZE, stream, false);
             launch_gdn_conv1d_decode_verify(
                 ws.qkv_buf, lw.conv1d_w, pools.conv_states[gi], conv_inter_dst,
@@ -372,11 +372,11 @@ void Qwen35Model::forward_decode_verify(
                 pools.ssm_states[gi], nullptr, d_state_slots, ws.q_buf,
                 B, q_len, commit_gdn_inplace, stream);
             launch_gdn_rmsnorm_gated(ws.q_buf, ws.qkv_buf, lw.gdn_norm, ws.attn_out, total_T, Qwen35Config::RMS_EPS, stream);
-            launch_fp8_linear(ctx.cublas, ws.attn_out, lw.out_proj, ws.sub_out, ws.d_splitk_scratch, ws.d_bf16_w_scratch, total_T, stream);
+            launch_quant_linear(ctx.cublas, ws.attn_out, lw.out_proj, ws.sub_out, ws.d_splitk_scratch, ws.d_bf16_w_scratch, total_T, stream);
             launch_fused_add_rmsnorm(ws.sub_out, ws.residual, lw.post_attention_layernorm, ws.norm_out, total_T, Qwen35Config::HIDDEN_SIZE, Qwen35Config::RMS_EPS, true, stream);
-            launch_fp8_linear(ctx.cublas, ws.norm_out, lw.gate_up_proj, ws.gate_up_buf, ws.d_splitk_scratch, ws.d_bf16_w_scratch, total_T, stream);
+            launch_quant_linear(ctx.cublas, ws.norm_out, lw.gate_up_proj, ws.gate_up_buf, ws.d_splitk_scratch, ws.d_bf16_w_scratch, total_T, stream);
             launch_silu_mul(ws.gate_up_buf, ws.mlp_mid, total_T, Qwen35Config::INTERMEDIATE_SIZE, stream);
-            launch_fp8_linear(ctx.cublas, ws.mlp_mid, lw.down_proj, ws.sub_out, ws.d_splitk_scratch, ws.d_bf16_w_scratch, total_T, stream);
+            launch_quant_linear(ctx.cublas, ws.mlp_mid, lw.down_proj, ws.sub_out, ws.d_splitk_scratch, ws.d_bf16_w_scratch, total_T, stream);
         }
     }
 

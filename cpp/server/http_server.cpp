@@ -8,6 +8,7 @@
 #include <cstring>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
+#include <optional>
 #include <sstream>
 #include <sys/socket.h>
 #include <thread>
@@ -132,8 +133,8 @@ Json build_tool_delta_json(const ToolCallDelta& td) {
 
 } // namespace
 
-HttpServer::HttpServer(Scheduler& sched, SidecarClient& sidecar, const std::string& host, int port)
-    : sched_(sched), sidecar_(sidecar), host_(host), port_(port) {}
+HttpServer::HttpServer(Scheduler& sched, const NativeTokenizer& tok, const std::string& host, int port)
+    : sched_(sched), tok_(tok), host_(host), port_(port) {}
 
 HttpServer::~HttpServer() { stop(); }
 
@@ -432,6 +433,12 @@ void HttpServer::handle_server_info(int fd) {
     resp["max_running_requests"] = sched_.cfg.max_running_requests;
     resp["speculative_algorithm"] = sched_.cfg.enable_dflash ? "DFLASH" : "NONE";
     resp["speculative_num_draft_tokens"] = sched_.cfg.enable_dflash ? sched_.cfg.block_size : 0;
+    const auto* wb = sched_.target.weights.backend;
+    resp["weight_backend"] = wb ? wb->id() : "unknown";
+    resp["weight_quant"] = wb ? wb->description() : "unknown";
+    resp["tokenizer"] = "native_cpp_bpe";
+    resp["chat_template"] = tok_.has_chat_template() ? "minja" : "none";
+    resp["detokenizer"] = "native_cpp_bpe";
     resp["internal_states"] = Json::Array{std::move(st)};
     send_response(fd, 200, "OK", "application/json", resp.dump());
 }
@@ -446,7 +453,7 @@ void HttpServer::handle_completions(int fd, const std::string& body, bool is_cha
         return;
     }
 
-    // Tokenize via sidecar
+    // Tokenize natively in C++ (minja chat template + utf8proc + PCRE2 + ByteLevel BPE)
     std::vector<int32_t> prompt_ids;
     bool start_in_think = false;
     int sys_prefix_len = 0;
@@ -503,14 +510,17 @@ void HttpServer::handle_completions(int fd, const std::string& body, bool is_cha
                 merged_ctk["enable_thinking"] = req_json.at("enable_thinking").as_bool();
             }
             const Json* ctk_ptr = merged_ctk.as_object().empty() ? nullptr : &merged_ctk;
-            prompt_ids = sidecar_.render_chat(req_json.at("messages"), effective_tools_ptr, ctk_ptr, &start_in_think, &sys_prefix_len);
+            ChatRenderResult cr = tok_.render_chat(req_json.at("messages"), effective_tools_ptr, ctk_ptr, true);
+            prompt_ids = std::move(cr.token_ids);
+            start_in_think = cr.in_think;
+            sys_prefix_len = cr.sys_prefix_len;
         } else {
             if (!req_json.contains("prompt")) {
                 send_json_error(fd, 400, "Bad Request", "Missing prompt field");
                 return;
             }
             if (req_json.at("prompt").is_string()) {
-                prompt_ids = sidecar_.tokenize(req_json.at("prompt").as_string(), false);
+                prompt_ids = tok_.encode(req_json.at("prompt").as_string(), false);
             } else if (req_json.at("prompt").is_array()) {
                 for (const auto& x : req_json.at("prompt").as_array()) prompt_ids.push_back((int32_t)x.as_int());
             } else {
@@ -596,7 +606,6 @@ void HttpServer::handle_completions(int fd, const std::string& body, bool is_cha
         }
 
         std::vector<int32_t> all_ids;
-        size_t last_detok_len = 0;
         std::string full_text;
         std::string prev_text;
         std::string prev_reasoning;
@@ -626,9 +635,12 @@ void HttpServer::handle_completions(int fd, const std::string& body, bool is_cha
             return send_sse_chunk(fd, chunk.dump());
         };
 
+        BpeDetokenizer::StreamDecoder stream_dec(tok_.detokenizer(), true);
+
         std::vector<TokenEvent> batch;
         bool done = false;
         while (!done) {
+            size_t prev_full_len = full_text.size();
             req->pop_events_batch(batch);
             for (const auto& ev : batch) {
                 if (ev.finished) {
@@ -637,14 +649,20 @@ void HttpServer::handle_completions(int fd, const std::string& body, bool is_cha
                     break;
                 }
                 all_ids.push_back(ev.token_id);
+                stream_dec.push(ev.token_id, full_text);
+            }
+            if (done) {
+                stream_dec.finish(full_text);
             }
             if (all_ids.empty()) {
                 if (done) break;
                 continue;
             }
-            if (all_ids.size() != last_detok_len) {
-                full_text = sidecar_.detokenize(all_ids, true);
-                last_detok_len = all_ids.size();
+
+            // Native incremental decoder holds incomplete multi-byte UTF-8 sequences in pending_
+            // and skips special tokens in O(1); skip emitting when no new valid UTF-8 arrived yet.
+            if (!done && full_text.size() == prev_full_len) {
+                continue;
             }
 
             // Check stop strings
@@ -658,14 +676,6 @@ void HttpServer::handle_completions(int fd, const std::string& body, bool is_cha
                     req->cancelled.store(true);
                     break;
                 }
-            }
-
-            // Avoid emitting incomplete UTF-8 trailing replacement character unless finished
-            if (!done && !hit_stop && full_text.size() >= 3 &&
-                (unsigned char)full_text[full_text.size() - 3] == 0xEF &&
-                (unsigned char)full_text[full_text.size() - 2] == 0xBF &&
-                (unsigned char)full_text[full_text.size() - 1] == 0xBD) {
-                continue;
             }
 
             if (is_chat) {
@@ -793,7 +803,7 @@ void HttpServer::handle_completions(int fd, const std::string& body, bool is_cha
             if (ev.finished) { finish_reason = ev.finish_reason; break; }
             all_ids.push_back(ev.token_id);
         }
-        std::string full_text = sidecar_.detokenize(all_ids, true);
+        std::string full_text = tok_.decode(all_ids, true);
         for (const auto& st : sp.stop_strings) {
             size_t p = full_text.find(st);
             if (p != std::string::npos) {

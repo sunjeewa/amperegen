@@ -102,6 +102,7 @@ struct EngineConfig {
     std::string model_dir = "./models/Qwen3.8-27B-FP8";
     std::string draft_dir = "./models/Qwen3.8-27B-DFlash2";
     std::string served_model_name = "Qwen3.8-27B-FP8";
+    std::string weight_backend = "auto"; // "auto" or explicit compiled plugin ID (e.g. "qwen_fp8", "redhat_int4")
     int context_length = 200000;
     bool allow_auto_truncate = true;
     int max_running_requests = 16;

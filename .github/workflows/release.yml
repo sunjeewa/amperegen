@@ -7,7 +7,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "Release tag (e.g. v0.1.0)"
+        description: "Release tag (e.g. v0.2.0)"
         required: true
         type: string
 
@@ -34,30 +34,32 @@ jobs:
           echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
           echo "archive=amperegen-${TAG}-linux-x86_64-cu128-sm80.tar.gz" >> "$GITHUB_OUTPUT"
 
-      - name: Install CMake and Ninja
+      - name: Install build dependencies
         run: |
           apt-get update
-          apt-get install -y --no-install-recommends cmake ninja-build
+          apt-get install -y --no-install-recommends cmake ninja-build pkg-config libpcre2-dev libutf8proc-dev
 
       - name: Configure & Build (portable x86-64-v3, sm_80)
         run: |
           cmake -S . -B build -G Ninja \
             -DCMAKE_BUILD_TYPE=Release \
             -DAMPEREGEN_PORTABLE=ON
-          ninja -C build amperegen amperegen_test amperegen_unit_tests
+          ninja -C build amperegen amperegen_test amperegen_unit_tests amperegen_bpe_detok_tests amperegen_tokenizer_tests
 
       - name: Run CPU unit tests
-        run: ./build/amperegen_unit_tests
+        run: |
+          ./build/amperegen_unit_tests
+          ./build/amperegen_bpe_detok_tests
+          ./build/amperegen_tokenizer_tests
 
       - name: Package release archive
         run: |
           STAGE="dist/amperegen-${{ steps.meta.outputs.tag }}-linux-x86_64-cu128-sm80"
-          mkdir -p "${STAGE}/bin" "${STAGE}/sidecar" "${STAGE}/docs"
+          mkdir -p "${STAGE}/bin" "${STAGE}/docs"
           cp build/amperegen build/amperegen_test "${STAGE}/bin/"
-          cp sidecar/app.py sidecar/requirements.txt "${STAGE}/sidecar/"
-          cp docs/amperegen.service docs/BENCHMARK.md "${STAGE}/docs/"
+          cp docs/amperegen.service docs/amperegen-int4.service docs/BENCHMARK.md "${STAGE}/docs/"
           cp README.md LICENSE THIRD_PARTY.md "${STAGE}/"
-          chmod +x "${STAGE}/bin/amperegen" "${STAGE}/bin/amperegen_test" "${STAGE}/sidecar/app.py"
+          chmod +x "${STAGE}/bin/amperegen" "${STAGE}/bin/amperegen_test"
           tar -C dist -czf "dist/${{ steps.meta.outputs.archive }}" "$(basename "${STAGE}")"
           (cd dist && sha256sum "${{ steps.meta.outputs.archive }}" > SHA256SUMS.txt)
           cat dist/SHA256SUMS.txt
@@ -75,18 +77,16 @@ jobs:
             ### Runtime Requirements
             - Linux `x86_64` with glibc >= 2.35 (Ubuntu 22.04+, Debian 12+, Fedora 36+, RHEL/Rocky 9+)
             - NVIDIA Driver supporting CUDA 12.8+ and CUDA 12 runtime libraries (`libcudart.so.12`, `libcublas.so.12`, `libcublasLt.so.12`)
-            - Python 3.10+ with `pip install -r sidecar/requirements.txt` for the tokenizer sidecar
+            - `libpcre2-8` and `libutf8proc` runtime libraries
 
             ### Quick Start
             ```bash
             tar -xzf ${{ steps.meta.outputs.archive }}
             cd amperegen-${{ steps.meta.outputs.tag }}-linux-x86_64-cu128-sm80
-            python3 -m venv .venv && .venv/bin/pip install -r sidecar/requirements.txt
             ./bin/amperegen \
-              --model-path /path/to/Qwen3.8-27B-FP8 \
+              --model-path /path/to/Qwen3.8-27B-INT4 \
               --draft-path /path/to/Qwen3.8-27B-DFlash2 \
-              --python ./.venv/bin/python \
-              --sidecar-script ./sidecar/app.py
+              --served-model-name Qwen3.8-27B-INT4
             ```
           files: |
             dist/${{ steps.meta.outputs.archive }}
